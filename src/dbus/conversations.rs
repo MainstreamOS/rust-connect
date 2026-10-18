@@ -432,6 +432,7 @@ impl Sms {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     #[test]
     fn android_v2_metadata_survives_the_dbus_boundary() {

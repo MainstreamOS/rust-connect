@@ -2,6 +2,28 @@
 use crate::utils::errors::Result;
 use std::path::Path;
 
+/// Stable device-scoped identity for desktop notification history and replay.
+pub fn notification_key(device: &str, id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(format!("{device}\0{id}").as_bytes())[..12])
+}
+
+/// A local URL must stay a URL: bare paths are interpreted as theme icons by
+/// some notification servers. Encode delimiters in user-controlled directories.
+pub fn file_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file://");
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
+            uri.push(*byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    uri
+}
+
 /// Preserve normal KDE IDs; escape the reserved prefix as well to avoid collisions.
 pub fn component(value: &str) -> String {
     if !value.is_empty()

@@ -229,6 +229,15 @@ impl AppState {
             let mut failed = 0usize;
             for pkt in &packets {
                 if let Err(e) = self.connection_manager.send_packet(device_id, pkt).await {
+                    // Unsupported features cannot recover on another pass.
+                    // Retrying them also repeats every successful plugin's
+                    // initialization, including full phone history requests.
+                    if matches!(
+                        e,
+                        crate::utils::errors::Error::CapabilityNotSupported { .. }
+                    ) {
+                        continue;
+                    }
                     failed += 1;
                     tracing::debug!(
                         device_id = %device_id,

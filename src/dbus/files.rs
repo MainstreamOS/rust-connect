@@ -1,6 +1,9 @@
 use super::{failure, Context};
 use crate::{
-    plugins::sftp::{MountState, SftpConnectionInfo},
+    plugins::{
+        sftp::{MountState, SftpConnectionInfo},
+        PluginEvent,
+    },
     protocol::{payload_transfer::PayloadTransfer, types::Packet},
 };
 use std::{
@@ -178,6 +181,25 @@ pub(crate) struct Sftp {
     pub context: Arc<Context>,
     pub device: String,
 }
+
+async fn wait_for_sftp_credentials(
+    mut events: tokio::sync::broadcast::Receiver<PluginEvent>,
+    device: &str,
+) -> zbus::fdo::Result<()> {
+    loop {
+        match events.recv().await {
+            Ok(PluginEvent::SftpUpdate {
+                device_id,
+                available: true,
+                mounted: false,
+                ..
+            }) if device_id == device => return Ok(()),
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(_) => return Err(failure("Phone file-browsing updates stopped")),
+        }
+    }
+}
+
 #[interface(name = "org.kde.kdeconnect.device.sftp")]
 impl Sftp {
     #[zbus(name = "mountAndWait")]
@@ -187,17 +209,19 @@ impl Sftp {
             return Ok(true);
         }
         let plugin = &self.context.app.plugins.sftp;
-        if plugin.get_connection(&self.device).is_none() {
-            self.context
-                .send(&self.device, plugin.request_sftp(&self.device))
-                .await?;
-            for _ in 0..50 {
-                if plugin.get_connection(&self.device).is_some() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
+        // Android may stop its SSH server while the main connection stays
+        // alive. Cached credentials alone do not mean it is still listening.
+        // Subscribe before requesting so even an immediate reply is observed.
+        let updates = self.context.app.plugin_events.subscribe();
+        self.context
+            .send(&self.device, plugin.request_sftp(&self.device))
+            .await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_sftp_credentials(updates, &self.device),
+        )
+        .await
+        .map_err(|_| failure("Phone did not refresh file-browsing credentials"))??;
         let mut info = plugin
             .get_connection(&self.device)
             .ok_or_else(|| failure("Phone did not provide file-browsing credentials"))?;
@@ -263,4 +287,53 @@ impl Sftp {
     pub async fn mounted(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
     #[zbus(signal, name = "unmounted")]
     pub async fn unmounted(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn credentials(device: &str) -> PluginEvent {
+        PluginEvent::SftpUpdate {
+            device_id: device.into(),
+            ip: "127.0.0.1".into(),
+            port: 1739,
+            user: "test".into(),
+            path: "/".into(),
+            available: true,
+            mounted: false,
+            mount_point: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_credentials_waits_for_the_requested_phone() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let wait = wait_for_sftp_credentials(receiver, "phone");
+        tokio::pin!(wait);
+        sender.send(credentials("other-phone")).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut wait)
+                .await
+                .is_err()
+        );
+        sender.send(credentials("phone")).unwrap();
+        wait.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_credentials_recovers_from_a_lagged_event_stream() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        sender.send(credentials("other-phone")).unwrap();
+        sender.send(credentials("phone")).unwrap();
+        wait_for_sftp_credentials(receiver, "phone").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_credentials_reports_a_closed_event_stream() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        assert!(wait_for_sftp_credentials(receiver, "phone").await.is_err());
+    }
 }

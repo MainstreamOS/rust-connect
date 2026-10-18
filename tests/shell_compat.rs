@@ -56,22 +56,26 @@ impl Drop for Bus {
         let _ = self.child.wait();
     }
 }
+type NotificationContent = (String, String, Vec<String>);
+
 #[derive(Clone, Default)]
 struct Desktop {
     counter: Arc<AtomicU32>,
-    seen: Arc<Mutex<Vec<(String, String, Vec<String>)>>>,
+    seen: Arc<Mutex<Vec<NotificationContent>>>,
     hints: Arc<Mutex<Vec<HashMap<String, OwnedValue>>>>,
+    icons: Arc<Mutex<Vec<String>>>,
     gate: Option<Arc<tokio::sync::Semaphore>>,
     entered: Arc<AtomicU32>,
 }
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl Desktop {
+    #[allow(clippy::too_many_arguments)] // The freedesktop Notify wire signature.
     #[zbus(name = "Notify")]
     async fn notify(
         &self,
         _app: &str,
         replaces: u32,
-        _icon: &str,
+        icon: &str,
         title: &str,
         body: &str,
         actions: Vec<String>,
@@ -83,6 +87,7 @@ impl Desktop {
             gate.acquire().await.unwrap().forget();
         }
         self.hints.lock().unwrap().push(hints);
+        self.icons.lock().unwrap().push(icon.into());
         self.seen
             .lock()
             .unwrap()
@@ -1126,7 +1131,7 @@ async fn loopback_phone(app: &Arc<AppState>) -> LoopbackPhone {
         .get_peer_certificate(&"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
         .await
         .unwrap();
-    pair(&app, certificate).await;
+    pair(app, certificate).await;
     cert.store_peer_certificate(
         "desktopbbbbbbbbbbbbbbbbbbbbbbbbb",
         &peer
@@ -1577,6 +1582,131 @@ async fn exercise_backlog_recovery() {
         seen.lock().unwrap().len(),
         1,
         "an ended call must not ring again during recovery"
+    );
+    service.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notification_icons_follow_exact_updates_and_late_cache_availability() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data with # and %");
+    let app = state(&data).await;
+    let desktop = Desktop::default();
+    let seen = desktop.seen.clone();
+    let hints = desktop.hints.clone();
+    let icons = desktop.icons.clone();
+    let _desktop_bus = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name("org.freedesktop.Notifications")
+        .unwrap()
+        .serve_at("/org/freedesktop/Notifications", desktop)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let cache = data.join("notification-icons").join(PHONE);
+    std::fs::create_dir_all(&cache).unwrap();
+    let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for hash in [hash_a, hash_b] {
+        std::fs::write(cache.join(hash), b"fixture icon bytes").unwrap();
+    }
+    let send = |id: &str, name: &str, hash: Option<&str>| {
+        let packet = Packet::new(
+            "kdeconnect.notification".into(),
+            serde_json::json!({
+                "id":id,"appName":name,"title":"Steam sale in a Gmail subject","text":"Fixture only","payloadHash":hash
+            }),
+        );
+        let plugin = app.clone();
+        async move {
+            plugin
+                .plugins
+                .notification
+                .handle_packet(PHONE, packet)
+                .await
+                .unwrap();
+        }
+    };
+    // Body artwork stays separate from the header app icon for each notification.
+    send("mail", "Gmail", Some(hash_a)).await;
+    until(|| async { seen.lock().unwrap().len() == 1 }).await;
+    send("game", "Steam", Some(hash_b)).await;
+    until(|| async { seen.lock().unwrap().len() == 2 }).await;
+    for (index, hash) in [hash_a, hash_b].into_iter().enumerate() {
+        let expected = rust_connect::utils::compat::file_uri(&cache.join(hash));
+        assert_eq!(icons.lock().unwrap()[index], "");
+        let guard = hints.lock().unwrap();
+        assert_eq!(
+            <&str>::try_from(&guard[index]["image-path"]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            <&str>::try_from(&guard[index]["x-mainstream-image-role"]).unwrap(),
+            "notification-image"
+        );
+        assert_eq!(
+            <&str>::try_from(&guard[index]["x-mainstream-icon-hash"]).unwrap(),
+            hash
+        );
+        assert!(expected.contains("%23") && expected.contains("%25") && expected.contains("%20"));
+    }
+    // A replacement with a different icon must publish despite identical text.
+    send("mail", "Gmail", Some(hash_b)).await;
+    until(|| async { seen.lock().unwrap().len() == 3 }).await;
+    {
+        let guard = icons.lock().unwrap();
+        assert_eq!(guard[2], guard[1]);
+    }
+    {
+        let guard = hints.lock().unwrap();
+        assert_eq!(
+            <&str>::try_from(&guard[2]["image-path"]).unwrap(),
+            rust_connect::utils::compat::file_uri(&cache.join(hash_b))
+        );
+        let first_key = <&str>::try_from(&guard[0]["x-mainstream-notification-key"]).unwrap();
+        assert_ne!(
+            first_key,
+            <&str>::try_from(&guard[1]["x-mainstream-notification-key"]).unwrap()
+        );
+        assert_eq!(
+            first_key,
+            <&str>::try_from(&guard[2]["x-mainstream-notification-key"]).unwrap()
+        );
+    }
+    // Explicitly missing artwork clears the previous icon, rather than inheriting it.
+    send("mail", "Gmail", None).await;
+    until(|| async { seen.lock().unwrap().len() == 4 }).await;
+    assert_eq!(icons.lock().unwrap()[3], "");
+    assert!(!hints.lock().unwrap()[3].contains_key("image-path"));
+    let late = "cccccccccccccccccccccccccccccccc";
+    send("mail", "Gmail", Some(late)).await;
+    until(|| async { seen.lock().unwrap().len() == 5 }).await;
+    assert_eq!(icons.lock().unwrap()[4], "");
+    {
+        let guard = hints.lock().unwrap();
+        assert!(!guard[4].contains_key("image-path"));
+        assert_eq!(
+            <&str>::try_from(&guard[4]["x-mainstream-icon-hash"]).unwrap(),
+            late
+        );
+    }
+    std::fs::write(cache.join(late), b"late fixture icon").unwrap();
+    send("mail", "Gmail", Some(late)).await;
+    until(|| async { seen.lock().unwrap().len() == 6 }).await;
+    assert_eq!(icons.lock().unwrap()[5], "");
+    assert_eq!(
+        <&str>::try_from(&hints.lock().unwrap()[5]["image-path"]).unwrap(),
+        rust_connect::utils::compat::file_uri(&cache.join(late))
     );
     service.stop().await;
 }

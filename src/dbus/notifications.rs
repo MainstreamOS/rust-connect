@@ -2,7 +2,7 @@ use super::{failure, Context};
 use crate::{
     plugins::{telephony::TelephonyPlugin, PluginEvent},
     protocol::types::Packet,
-    utils::compat::component,
+    utils::compat::{component, file_uri, notification_key},
 };
 use std::{collections::HashMap, sync::Arc};
 use zbus::{
@@ -157,9 +157,20 @@ impl Context {
             return Ok(());
         }
         let previous = self.record(&device_id, &id);
-        let fingerprint =
-            serde_json::to_string(&(&app_name, &title, &text, &actions, &reply_id, &icon_hash))
-                .unwrap_or_default();
+        let image = icon_hash
+            .as_ref()
+            .and_then(|h| self.app.plugins.notification.icon_path(&device_id, h));
+        let fingerprint = serde_json::to_string(&(
+            &app_name,
+            &title,
+            &text,
+            &actions,
+            &reply_id,
+            &icon_hash,
+            image.is_some(),
+        ))
+        .unwrap_or_default();
+        let notification_key = notification_key(&device_id, &id);
         let dismissable = !id.starts_with("call:")
             && self
                 .app
@@ -252,20 +263,25 @@ impl Context {
         hints.insert("x-kde-appname", OwnedValue::from(Str::from("kdeconnect")));
         hints.insert("desktop-entry", OwnedValue::from(Str::from("rust-connect")));
         hints.insert(
+            "x-mainstream-notification-key",
+            OwnedValue::from(Str::from(notification_key.as_str())),
+        );
+        hints.insert(
             "x-kde-display-appname",
             OwnedValue::from(Str::from(record.app.as_str())),
         );
         if silent {
             hints.insert("suppress-sound", OwnedValue::from(true));
         }
-        if let Some(image) = icon_hash
-            .as_ref()
-            .and_then(|h| self.app.plugins.notification.icon_path(&device_id, h))
-        {
+        if let Some(hash) = icon_hash.as_deref() {
             hints.insert(
-                "image-path",
-                OwnedValue::from(Str::from(image.to_string_lossy().as_ref())),
+                "x-mainstream-image-role",
+                OwnedValue::from(Str::from("notification-image")),
             );
+            hints.insert("x-mainstream-icon-hash", OwnedValue::from(Str::from(hash)));
+        }
+        if let Some(image) = image {
+            hints.insert("image-path", OwnedValue::from(Str::from(file_uri(&image))));
         }
         let mut actions = Vec::new();
         if record.reply.is_some() {
@@ -291,9 +307,10 @@ impl Context {
                 })),
             );
             if let Some(path) = call_picture {
+                hints.insert("image-path", OwnedValue::from(Str::from(file_uri(&path))));
                 hints.insert(
-                    "image-path",
-                    OwnedValue::from(Str::from(path.to_string_lossy().as_ref())),
+                    "x-mainstream-image-role",
+                    OwnedValue::from(Str::from("contact")),
                 );
             }
         }
