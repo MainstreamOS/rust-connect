@@ -1,0 +1,5 @@
+# Installed by rust-connect shell compatibility.
+[D-BUS Service]
+Name=org.kde.kdeconnect
+Exec=@BINARY@
+SystemdService=rust-connect.service

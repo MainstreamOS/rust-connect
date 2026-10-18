@@ -41,10 +41,11 @@ rustls-pki-types = { version = "1", features = ["alloc"] }
 # Desktop notifications
 notify-rust = "4"
 
-# Session D-Bus for the MPRIS plugin (org.mpris.MediaPlayer2.* control).
+# Session D-Bus for MPRIS and Mainstream desktop phone compatibility.
+# Object handlers use Tokio filesystem/network APIs, so share its runtime.
 # zbus 5.14 is already in the tree as a notify-rust transitive dependency, so
 # this adds no new transitive crates.
-zbus = "5"
+zbus = { version = "5", features = ["tokio"] }
 
 # Process-group kill for runcommand timeout (killpg). Already in the tree as
 # a transitive dependency of half the stack, so this adds no new crates.

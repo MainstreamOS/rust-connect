@@ -29,7 +29,10 @@
 //! kdeconnect-kde's own declaration (plugins/contacts/kdeconnect_contacts.json).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock as StdRwLock,
+};
 
 use tracing::{info, warn};
 
@@ -74,9 +77,13 @@ pub struct Contact {
 /// plugin instance is shared across all per-device connection loops.
 #[derive(Default)]
 struct DeviceContacts {
+    revision: u64,
+    snapshot_received: bool,
     /// uid -> last timestamp reported by the phone (normalized to a plain
     /// string; the phone sends digits-as-string)
     timestamps: HashMap<String, String>,
+    /// Changed/new cards still outstanding in the current snapshot.
+    pending: HashSet<String>,
     /// uid -> stored contact
     contacts: HashMap<String, Contact>,
     /// Sum of `Contact::vcard.len()` over `contacts` (the byte-counting
@@ -89,6 +96,7 @@ struct DeviceContacts {
 pub struct ContactsPlugin {
     /// device_id -> per-device state
     devices: Arc<StdRwLock<HashMap<String, DeviceContacts>>>,
+    revision: AtomicU64,
 }
 
 impl Default for ContactsPlugin {
@@ -101,6 +109,7 @@ impl ContactsPlugin {
     pub fn new() -> Self {
         Self {
             devices: Arc::new(StdRwLock::new(HashMap::new())),
+            revision: AtomicU64::new(1),
         }
     }
 
@@ -114,6 +123,29 @@ impl ContactsPlugin {
             .unwrap_or_default();
         contacts.sort_by(|a, b| a.uid.cmp(&b.uid));
         contacts
+    }
+
+    /// None until a complete snapshot has arrived; an empty completed snapshot
+    /// is distinct from never having synchronized this device.
+    pub fn synchronized_contacts(&self, device: &str) -> Option<Vec<Contact>> {
+        self.contacts_since(device, None)
+            .map(|(_, contacts)| contacts)
+    }
+
+    /// The revision check happens under the same lock as the snapshot. An idle
+    /// mirror never clones vCards/photos or walks every contact to hash them.
+    pub fn contacts_since(
+        &self,
+        device: &str,
+        revision: Option<u64>,
+    ) -> Option<(u64, Vec<Contact>)> {
+        let devices = self.devices.read().unwrap_or_else(|e| e.into_inner());
+        let state = devices.get(device)?;
+        if !state.snapshot_received || !state.pending.is_empty() || revision == Some(state.revision)
+        {
+            return None;
+        }
+        Some((state.revision, state.contacts.values().cloned().collect()))
     }
 
     /// Request-all-uids packet. Empty body per upstream
@@ -265,6 +297,7 @@ impl ContactsPlugin {
             }
 
             state.total_vcard_bytes = prospective_bytes;
+            state.pending.remove(&uid);
             state.contacts.insert(uid, contact);
             stored += 1;
         }
@@ -360,7 +393,7 @@ impl Plugin for ContactsPlugin {
                         .filter(|(uid, ts)| {
                             let prev = state.timestamps.get(*uid);
                             let has_vcard = state.contacts.contains_key(*uid);
-                            prev != Some(ts) || !has_vcard
+                            prev != Some(ts) || !has_vcard || state.pending.contains(*uid)
                         })
                         .map(|(uid, _)| uid.clone())
                         .collect();
@@ -370,6 +403,11 @@ impl Plugin for ContactsPlugin {
                     // Recompute total_vcard_bytes from the retained slice so
                     // the byte cap tracks the prune exactly: a contacts::len()
                     // change must be a total_vcard_bytes change too.
+                    if !state.snapshot_received || state.timestamps != reported {
+                        state.revision = self.revision.fetch_add(1, Ordering::Relaxed);
+                    }
+                    state.snapshot_received = true;
+                    state.pending = to_fetch.iter().cloned().collect();
                     state.timestamps = reported;
                     state.contacts.retain(|uid, _| reported_uids.contains(uid));
                     state.total_vcard_bytes = state.contacts.values().map(|c| c.vcard.len()).sum();
@@ -430,6 +468,9 @@ impl Plugin for ContactsPlugin {
                 let reported: HashSet<String> = state.timestamps.keys().cloned().collect();
                 let (stored, dropped_unreported, dropped_cap) =
                     Self::store_vcards(state, &reported, parsed);
+                if stored > 0 {
+                    state.revision = self.revision.fetch_add(1, Ordering::Relaxed);
+                }
 
                 if dropped_unreported > 0 {
                     warn!(
@@ -669,9 +710,14 @@ mod tests {
             "kdeconnect.contacts.response_uids_timestamps".to_string(),
             serde_json::json!({ "uids": ["1", "2", "3"], "1": "100", "2": "201", "3": "300" }),
         );
-        // uid 3 has no stored vcard yet, so it IS re-requested.
+        // Neither the changed uid 2 nor the new uid 3 has answered yet.
+        // Both remain pending; an unchanged snapshot must not certify an old card.
         let reply = plugin.handle_packet("d", p4).await.unwrap().unwrap();
-        assert_eq!(reply[0].body, serde_json::json!({ "uids": ["3"] }));
+        let mut requested: Vec<String> =
+            serde_json::from_value(reply[0].body["uids"].clone()).unwrap();
+        requested.sort();
+        assert_eq!(requested, vec!["2", "3"]);
+        assert!(plugin.synchronized_contacts("d").is_none());
     }
 
     #[tokio::test]
@@ -1218,5 +1264,89 @@ mod tests {
         // expected since only one contact remains.
         let stored_bytes: usize = plugin.get_contacts("d").iter().map(|c| c.vcard.len()).sum();
         assert_eq!(stored_bytes, expected_bytes);
+    }
+    #[tokio::test]
+    async fn completed_revisions_skip_idle_photos_and_survive_reconnect() {
+        let plugin = ContactsPlugin::new();
+        let snapshot = serde_json::json!({"uids":["mom"],"mom":"1"});
+        let card = format!(
+            "BEGIN:VCARD\nFN:Mom\nPHOTO;ENCODING=b:{}\nEND:VCARD",
+            "a".repeat(100_000)
+        );
+        plugin
+            .handle_packet(
+                "phone",
+                Packet::new(
+                    "kdeconnect.contacts.response_uids_timestamps".into(),
+                    snapshot.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(plugin.contacts_since("phone", None).is_none());
+        plugin
+            .handle_packet(
+                "phone",
+                Packet::new(
+                    "kdeconnect.contacts.response_vcards".into(),
+                    serde_json::json!({"uids":["mom"],"mom":card}),
+                ),
+            )
+            .await
+            .unwrap();
+        let (revision, cards) = plugin.contacts_since("phone", None).unwrap();
+        assert_eq!(cards.len(), 1);
+        // Same revision returns BEFORE any vCard/photo clone.
+        for _ in 0..10 {
+            assert!(plugin.contacts_since("phone", Some(revision)).is_none());
+        }
+        plugin
+            .handle_packet(
+                "phone",
+                Packet::new(
+                    "kdeconnect.contacts.response_uids_timestamps".into(),
+                    snapshot.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(plugin.contacts_since("phone", Some(revision)).is_none());
+        plugin.on_disconnected("phone").await;
+        plugin
+            .handle_packet(
+                "phone",
+                Packet::new(
+                    "kdeconnect.contacts.response_uids_timestamps".into(),
+                    snapshot,
+                ),
+            )
+            .await
+            .unwrap();
+        plugin
+            .handle_packet(
+                "phone",
+                Packet::new(
+                    "kdeconnect.contacts.response_vcards".into(),
+                    serde_json::json!({"uids":["mom"],"mom":card}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(plugin.contacts_since("phone", Some(revision)).unwrap().0 > revision);
+        plugin
+            .handle_packet(
+                "phone",
+                Packet::new(
+                    "kdeconnect.contacts.response_uids_timestamps".into(),
+                    serde_json::json!({"uids":[]}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(plugin
+            .contacts_since("phone", Some(revision))
+            .unwrap()
+            .1
+            .is_empty());
     }
 }

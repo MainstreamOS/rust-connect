@@ -32,6 +32,10 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
+    pub(super) fn web_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn new(config: ClientConfig) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(3)))

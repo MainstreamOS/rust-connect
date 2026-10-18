@@ -61,6 +61,8 @@ pub struct NotificationBody {
     #[serde(default)]
     pub silent: Option<bool>,
     #[serde(default)]
+    pub is_clearable: Option<bool>,
+    #[serde(default)]
     pub actions: Option<Vec<String>>,
     #[serde(default)]
     pub conversation: Option<serde_json::Value>,
@@ -89,6 +91,7 @@ pub struct NotificationEntry {
     pub text: String,
     pub is_cancel: bool,
     pub silent: bool,
+    pub dismissable: bool,
     pub actions: Option<Vec<String>>,
     pub conversation: Option<serde_json::Value>,
     pub group_name: Option<String>,
@@ -103,7 +106,9 @@ pub struct NotificationEntry {
 pub struct NotificationPlugin {
     plugin_events: Arc<PluginEventBroadcaster>,
     show_desktop: bool,
+    compatibility_desktop: std::sync::atomic::AtomicBool,
     history: Arc<RwLock<VecDeque<NotificationEntry>>>,
+    active: Arc<RwLock<HashMap<(String, String), NotificationEntry>>>,
     /// Dedupe state for the DESKTOP side: (device_id, notification id) →
     /// what we last posted. Keyed by device, NOT by link — a re-sync after
     /// a link replace (the test phone's 60s redial cadence, or any reconnect)
@@ -207,13 +212,21 @@ async fn close_desktop_notification(replaces_id: u32) {
 }
 
 impl NotificationPlugin {
+    /// The compatibility service publishes desktop alerts and routes actions;
+    /// the packet plugin continues to own payload authentication and history.
+    pub fn use_compatibility_desktop(&self, enabled: bool) {
+        self.compatibility_desktop
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
     pub fn new(plugin_events: Arc<PluginEventBroadcaster>) -> Self {
         Self {
             plugin_events,
             show_desktop: true,
+            compatibility_desktop: std::sync::atomic::AtomicBool::new(false),
             history: Arc::new(RwLock::new(VecDeque::with_capacity(
                 MAX_NOTIFICATION_HISTORY,
             ))),
+            active: Arc::new(RwLock::new(HashMap::new())),
             dedupe: Arc::new(RwLock::new(HashMap::new())),
             dedupe_shadow: Arc::new(RwLock::new(HashMap::new())),
             icon_root: std::env::temp_dir().join("rust-connect-notification-icons"),
@@ -230,9 +243,11 @@ impl NotificationPlugin {
         Self {
             plugin_events,
             show_desktop: false,
+            compatibility_desktop: std::sync::atomic::AtomicBool::new(false),
             history: Arc::new(RwLock::new(VecDeque::with_capacity(
                 MAX_NOTIFICATION_HISTORY,
             ))),
+            active: Arc::new(RwLock::new(HashMap::new())),
             dedupe: Arc::new(RwLock::new(HashMap::new())),
             dedupe_shadow: Arc::new(RwLock::new(HashMap::new())),
             icon_root: std::env::temp_dir().join("rust-connect-notification-icons"),
@@ -596,6 +611,24 @@ impl NotificationPlugin {
         entries
     }
 
+    /// Active phone state is separate from the 100-row REST history. The
+    /// desktop adapter can resynchronize after a bounded event stream lags.
+    pub fn active_notifications(&self) -> Vec<NotificationEntry> {
+        self.active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+    pub fn active_notification(&self, device: &str, id: &str) -> Option<NotificationEntry> {
+        self.active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(device.into(), id.into()))
+            .cloned()
+    }
+
     /// The reply handle for a notification, if the phone marked it repliable.
     ///
     /// Android mints this per repliable notification and keys its `pendingIntents`
@@ -604,6 +637,9 @@ impl NotificationPlugin {
     /// lookup misses. `None` means the notification carried no RemoteInput action and
     /// cannot be replied to.
     pub fn reply_handle(&self, device_id: &str, notification_id: &str) -> Option<String> {
+        if let Some(entry) = self.active_notification(device_id, notification_id) {
+            return entry.reply_id;
+        }
         let history = self.history.read().unwrap_or_else(|e| e.into_inner());
         history
             .iter()
@@ -614,6 +650,9 @@ impl NotificationPlugin {
 
     /// Whether the current replacement of a notification exposes this action.
     pub fn has_action(&self, device_id: &str, notification_id: &str, action: &str) -> bool {
+        if let Some(entry) = self.active_notification(device_id, notification_id) {
+            return entry.actions.is_some_and(|a| a.iter().any(|a| a == action));
+        }
         let history = self.history.read().unwrap_or_else(|e| e.into_inner());
         history.iter().rev().any(|entry| {
             entry.device_id == device_id
@@ -638,6 +677,12 @@ impl NotificationPlugin {
     /// path emits (see the `is_cancel` branch of `handle_packet`), so an SSE
     /// consumer removes the row identically whichever side started it.
     pub fn dismiss(&self, device_id: &str, notification_id: &str) -> bool {
+        let active_removed = self
+            .active
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(device_id.into(), notification_id.into()))
+            .is_some();
         let removed = {
             let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
             let before = history.len();
@@ -669,7 +714,7 @@ impl NotificationPlugin {
             icon_url: None,
         });
 
-        removed
+        removed || active_removed
     }
 }
 
@@ -691,6 +736,10 @@ impl Plugin for NotificationPlugin {
     /// content hash and a server id, never servable state, so the
     /// "nothing stays servable under its id" guarantee holds.
     async fn on_disconnected(&self, device_id: &str) {
+        self.active
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(device, _), _| device != device_id);
         self.history
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -736,6 +785,12 @@ impl Plugin for NotificationPlugin {
             }
         }
 
+        if self
+            .compatibility_desktop
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let hashes = self
             .icon_lru
             .write()
@@ -770,6 +825,7 @@ impl Plugin for NotificationPlugin {
             "kdeconnect.notification".to_string(),
             "kdeconnect.notification.request".to_string(),
             "kdeconnect.notification.reply".to_string(),
+            "kdeconnect.notification.action".to_string(),
         ]
     }
 
@@ -826,6 +882,10 @@ impl Plugin for NotificationPlugin {
                 .map(|hash| Self::icon_api_url(device_id, hash));
 
             if is_cancel {
+                self.active
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&(device_id.into(), id.into()));
                 let removed_from_history = {
                     let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
                     let before = history.len();
@@ -915,6 +975,9 @@ impl Plugin for NotificationPlugin {
                 );
             }
             if self.show_desktop
+                && !self
+                    .compatibility_desktop
+                    .load(std::sync::atomic::Ordering::Acquire)
                 && (std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok())
                 && !matches!(action, DesktopAction::Suppress)
             {
@@ -961,27 +1024,6 @@ impl Plugin for NotificationPlugin {
                 debug!("No display server detected, skipping desktop notification");
             }
 
-            self.plugin_events.broadcast(PluginEvent::Notification {
-                device_id: device_id.to_string(),
-                id: id.to_string(),
-                app_name: app_name.to_string(),
-                title: title.to_string(),
-                text: text.to_string(),
-                ticker: if ticker.is_empty() {
-                    None
-                } else {
-                    Some(ticker.to_string())
-                },
-                is_cancel: false,
-                silent,
-                actions: actions.clone(),
-                conversation: conversation.clone(),
-                group_name: group_name.clone(),
-                reply_id: reply_id.clone(),
-                icon_hash: icon_hash.clone(),
-                icon_url: icon_url.clone(),
-            });
-
             if let Ok(mut history) = self.history.write() {
                 // Android's notification key is the stable identity
                 // (NotificationsPlugin.kt:220-225,251). Initial sync re-sends
@@ -990,7 +1032,7 @@ impl Plugin for NotificationPlugin {
                 if !id.is_empty() {
                     history.retain(|entry| !(entry.device_id == device_id && entry.id == id));
                 }
-                history.push_back(NotificationEntry {
+                let entry = NotificationEntry {
                     device_id: device_id.to_string(),
                     id: id.to_string(),
                     app_name: app_name.to_string(),
@@ -998,14 +1040,29 @@ impl Plugin for NotificationPlugin {
                     text: text.to_string(),
                     is_cancel: false,
                     silent,
-                    actions,
-                    conversation,
-                    group_name,
-                    reply_id,
-                    icon_hash,
-                    icon_url,
+                    dismissable: body.is_clearable.unwrap_or(true),
+                    actions: actions.clone(),
+                    conversation: conversation.clone(),
+                    group_name: group_name.clone(),
+                    reply_id: reply_id.clone(),
+                    icon_hash: icon_hash.clone(),
+                    icon_url: icon_url.clone(),
                     received_at: chrono::Utc::now(),
-                });
+                };
+                {
+                    let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+                    active.insert((device_id.into(), id.into()), entry.clone());
+                    if active.len() > 2048 {
+                        if let Some(oldest) = active
+                            .iter()
+                            .min_by_key(|(_, n)| n.received_at)
+                            .map(|(key, _)| key.clone())
+                        {
+                            active.remove(&oldest);
+                        }
+                    }
+                }
+                history.push_back(entry);
                 let mut evicted_keys: Vec<(String, String)> = Vec::new();
                 while history.len() > MAX_NOTIFICATION_HISTORY {
                     if let Some(evicted) = history.pop_front() {
@@ -1031,6 +1088,26 @@ impl Plugin for NotificationPlugin {
                     }
                 }
             }
+            self.plugin_events.broadcast(PluginEvent::Notification {
+                device_id: device_id.to_string(),
+                id: id.to_string(),
+                app_name: app_name.to_string(),
+                title: title.to_string(),
+                text: text.to_string(),
+                ticker: if ticker.is_empty() {
+                    None
+                } else {
+                    Some(ticker.to_string())
+                },
+                is_cancel: false,
+                silent,
+                actions: actions.clone(),
+                conversation: conversation.clone(),
+                group_name: group_name.clone(),
+                reply_id: reply_id.clone(),
+                icon_hash: icon_hash.clone(),
+                icon_url: icon_url.clone(),
+            });
         }
         Ok(None)
     }

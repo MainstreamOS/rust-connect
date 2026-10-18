@@ -90,6 +90,9 @@ fn kind(event: &ServerEvent) -> &'static str {
         ServerEvent::Device(DeviceEvent::Removed { .. }) => "device.removed",
         ServerEvent::Plugin(p) => match &**p {
             PluginEvent::Notification { .. } => "plugin.notification",
+            PluginEvent::SmsMessagesReceived { .. } => "plugin.sms_messages_received",
+            PluginEvent::SmsAttachmentFailed { .. } => "plugin.sms_attachment_failed",
+            PluginEvent::SmsAttachmentReceived { .. } => "plugin.sms_attachment_received",
             PluginEvent::Battery { .. } => "plugin.battery",
             PluginEvent::MprisUpdate { .. } => "plugin.mpris_update",
             PluginEvent::TelephonyUpdate { .. } => "plugin.telephony_update",
@@ -121,6 +124,9 @@ pub(crate) const ALL_KINDS: &[&str] = &[
     "device.disconnected",
     "device.removed",
     "plugin.notification",
+    "plugin.sms_messages_received",
+    "plugin.sms_attachment_received",
+    "plugin.sms_attachment_failed",
     "plugin.battery",
     "plugin.mpris_update",
     "plugin.telephony_update",
@@ -656,10 +662,10 @@ mod tests {
 
     /// Every name in `ALL_KINDS` is what `kind` returns for a sample of
     /// constructible events, and the two lists have the same size as the
-    /// arms in `kind` (21).
+    /// arms in `kind` (24).
     #[test]
     fn test_all_kinds_matches_kind_fn_samples() {
-        assert_eq!(ALL_KINDS.len(), 21);
+        assert_eq!(ALL_KINDS.len(), 24);
         let samples: Vec<(ServerEvent, &str)> = vec![
             (
                 ServerEvent::Device(state_changed("d")),
@@ -674,6 +680,23 @@ mod tests {
                 "plugin.battery",
             ),
         ];
+        let mut samples = samples;
+        samples.push((
+            ServerEvent::Plugin(Box::new(PluginEvent::SmsMessagesReceived {
+                device_id: "d".into(),
+                messages: vec![],
+                created_threads: vec![],
+            })),
+            "plugin.sms_messages_received",
+        ));
+        samples.push((
+            ServerEvent::Plugin(Box::new(PluginEvent::SmsAttachmentReceived {
+                device_id: "d".into(),
+                file_path: "/test".into(),
+                unique_identifier: "test".into(),
+            })),
+            "plugin.sms_attachment_received",
+        ));
         for (event, expected) in samples {
             assert_eq!(kind(&event), expected);
             assert!(ALL_KINDS.contains(&expected));

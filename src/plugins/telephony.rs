@@ -3,8 +3,11 @@
 //! Single Responsibility: Handle kdeconnect.telephony packets for incoming
 //! call and SMS notifications from the remote device.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock as StdRwLock,
+};
 
 use tracing::info;
 
@@ -68,8 +71,15 @@ where
 /// the log without bound for the life of a connection. Oldest out.
 pub const MAX_CALLS_PER_DEVICE: usize = 100;
 
+#[derive(Default)]
+struct DeviceCalls {
+    history: Vec<Arc<TelephonyInfo>>,
+    events: VecDeque<(u64, Arc<TelephonyInfo>)>,
+}
+
 pub struct TelephonyPlugin {
-    calls: Arc<StdRwLock<HashMap<String, Vec<TelephonyInfo>>>>,
+    calls: Arc<StdRwLock<HashMap<String, DeviceCalls>>>,
+    revision: AtomicU64,
     plugin_events: Arc<PluginEventBroadcaster>,
 }
 
@@ -77,6 +87,7 @@ impl TelephonyPlugin {
     pub fn new(plugin_events: Arc<PluginEventBroadcaster>) -> Self {
         Self {
             calls: Arc::new(StdRwLock::new(HashMap::new())),
+            revision: AtomicU64::new(1),
             plugin_events,
         }
     }
@@ -84,7 +95,31 @@ impl TelephonyPlugin {
     #[allow(clippy::expect_used)]
     pub fn get_calls(&self, device_id: &str) -> Vec<TelephonyInfo> {
         let calls = self.calls.read().unwrap_or_else(|e| e.into_inner());
-        calls.get(device_id).cloned().unwrap_or_default()
+        calls
+            .get(device_id)
+            .map(|calls| {
+                calls
+                    .history
+                    .iter()
+                    .map(|info| info.as_ref().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// Includes cancellation events, which cannot be recovered from history.
+    pub fn events_since(&self, device: &str, revision: u64) -> Vec<(u64, TelephonyInfo)> {
+        let calls = self.calls.read().unwrap_or_else(|e| e.into_inner());
+        calls
+            .get(device)
+            .map(|calls| {
+                calls
+                    .events
+                    .iter()
+                    .filter(|(r, _)| *r > revision)
+                    .map(|(revision, info)| (*revision, info.as_ref().clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -175,14 +210,20 @@ impl Plugin for TelephonyPlugin {
         // so it is the END of the call already in the list, not a new one.
         // kdeconnect-kde returns before creating any notification
         // (telephonyplugin.cpp:74-79). Appending would duplicate the entry.
-        if !info.is_cancel {
-            if let Ok(mut calls) = self.calls.write() {
-                let log = calls.entry(device_id.to_string()).or_default();
-                log.push(info.clone());
-                if log.len() > MAX_CALLS_PER_DEVICE {
-                    let excess = log.len() - MAX_CALLS_PER_DEVICE;
-                    log.drain(..excess);
+        if let Ok(mut calls) = self.calls.write() {
+            let log = calls.entry(device_id.to_string()).or_default();
+            let shared = Arc::new(info.clone());
+            if !info.is_cancel {
+                log.history.push(shared.clone());
+                if log.history.len() > MAX_CALLS_PER_DEVICE {
+                    log.history
+                        .drain(..log.history.len() - MAX_CALLS_PER_DEVICE);
                 }
+            }
+            let revision = self.revision.fetch_add(1, Ordering::Relaxed);
+            log.events.push_back((revision, shared));
+            while log.events.len() > MAX_CALLS_PER_DEVICE {
+                log.events.pop_front();
             }
         }
 

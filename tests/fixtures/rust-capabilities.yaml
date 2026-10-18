@@ -72,6 +72,7 @@ plugins:
       - kdeconnect.notification
       - kdeconnect.notification.request
       - kdeconnect.notification.reply
+      - kdeconnect.notification.action
   - name: pausemusic
     incoming_capabilities:
       - kdeconnect.telephony
@@ -132,9 +133,12 @@ plugins:
   - name: sms
     incoming_capabilities:
       - kdeconnect.sms.messages
+      - kdeconnect.sms.attachment_file
     outgoing_capabilities:
       - kdeconnect.sms.request
       - kdeconnect.sms.request_conversations
+      - kdeconnect.sms.request_conversation
+      - kdeconnect.sms.request_attachment
   - name: systemvolume
     incoming_capabilities:
       - kdeconnect.systemvolume

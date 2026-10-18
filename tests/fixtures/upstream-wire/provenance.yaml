@@ -588,3 +588,11 @@ fixtures:
     extraction_date: "2026-08-20"
     note: "Release packet the phone sends when the cursor exits the controlled region. Consumer reads it at shareinputdevicesplugin.cpp:129-138: barrier.p1() + releaseDelta becomes the position passed to portal Release. The producer's release seam (M1) is a store/callback; the portal release is M2."
     used_by: "src/plugins/shareinputdevices/mod.rs::test_handle_release_packet_parses_release_delta"
+
+  - file: sms/android_v2_batch.json
+    kind: hand-authored-from-observation
+    extraction_date: "2026-10-18"
+    source_file: src/main/java/org/kde/kdeconnect/helpers/SMSHelper.kt
+    observed_revision: f6a699de894d1bad83bfbcc61e5e757a54788051
+    note: "Synthetic IDs/content with schema transcribed independently from KDE Android f6a699de894d1bad83bfbcc61e5e757a54788051 SMSHelper Message.toJsonObject/Attachment.toJson and SMSPlugin.constructBulkMessagePacket. Uses actual thread_id, _id, sub_id, part_id, mime_type, encoded_thumbnail, unique_identifier keys. Not a live capture and not evidence from the older global capability pin."
+    used_by: "tests/shell_compat.rs::real_conversation_signals_and_variants_preserve_android_history"

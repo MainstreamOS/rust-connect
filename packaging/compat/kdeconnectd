@@ -1,0 +1,3 @@
+#!/bin/sh
+# Compatibility entry point for shells that detect KDE Connect by executable.
+exec "$(dirname -- "$0")/rust-connect" "$@"

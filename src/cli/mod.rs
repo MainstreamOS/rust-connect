@@ -91,6 +91,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Open the local device/pairing interface in the default browser
+    App,
     /// Show daemon health and device count
     Status,
     /// List known devices
@@ -287,6 +289,16 @@ pub fn execute(
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     match command {
+        Command::App => {
+            let status = std::process::Command::new("xdg-open")
+                .arg(client.web_url())
+                .status()
+                .map_err(|e| CliError::Usage(format!("Could not open device settings: {e}")))?;
+            if !status.success() {
+                return Err(CliError::Usage("Could not open device settings".into()));
+            }
+            Ok(())
+        }
         Command::Status => cmd_status(client, json, out),
         Command::Devices => cmd_devices(client, json, out),
         Command::Pair { device_id, yes } => cmd_pair(client, device_id, *yes, json, out),

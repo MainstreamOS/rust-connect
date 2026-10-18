@@ -46,6 +46,11 @@ From a source checkout:
 ./packaging/install-user-service.sh
 ```
 
+For Mainstream's Phone tab and Dynamic Island, the optional
+`./packaging/install-shell-compat.sh` adds KDE-compatible launchers and D-Bus
+activation after the source install. See the [compatibility and cutover guide](docs/mainstream-shell-compatibility.md)
+for the supported interfaces, remaining dependencies and device acceptance checks.
+
 Builds a release binary into `~/.local/bin`, installs the unit to
 `~/.config/systemd/user/`, and enables it. Re-run it to upgrade. Then:
 

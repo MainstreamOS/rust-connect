@@ -35,7 +35,12 @@ pub fn load_default_plugins(
                 .with_events(plugin_events.clone()),
         ),
         battery: Arc::new(super::BatteryPlugin::new(plugin_events.clone())),
-        sms: Arc::new(super::SmsPlugin::new()),
+        sms: Arc::new(super::SmsPlugin::new().with_runtime(
+            plugin_events.clone(),
+            connection_manager.clone(),
+            cert_manager.clone(),
+            data_dir.join("sms-attachments"),
+        )),
         // The connection manager is the fan-out path for local clipboard
         // changes; the session clipboard backend itself is enabled only at
         // the production entry point (bootstrap.rs create_state).

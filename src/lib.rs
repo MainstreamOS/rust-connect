@@ -48,6 +48,7 @@ pub mod bootstrap;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod dbus;
 pub mod device;
 pub mod plugins;
 pub mod protocol;

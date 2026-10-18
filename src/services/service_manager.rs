@@ -18,6 +18,7 @@ pub struct ServiceHandles {
     pub discovery: DiscoveryHandles,
     pub tcp: Option<tokio::task::JoinHandle<()>>,
     pub api: Option<tokio::task::JoinHandle<()>>,
+    pub dbus: Option<crate::dbus::DBusService>,
 }
 
 /// Handles for the discovery service.
@@ -67,17 +68,28 @@ pub async fn start_services(
     let tcp = start_tcp_listener(&state, tcp_listener, identity.clone(), shutdown.clone());
     let api = start_api_server(&state, shutdown.clone()).await?;
 
+    let dbus = match crate::dbus::DBusService::start(state.clone(), shutdown.clone()).await {
+        Ok(service) => Some(service),
+        Err(error) => {
+            warn!(%error,"Desktop phone integration unavailable on session D-Bus");
+            None
+        }
+    };
     info!(event = "daemon_ready", "Daemon ready - all systems active");
 
     Ok(ServiceHandles {
         discovery,
         tcp,
         api,
+        dbus,
     })
 }
 
 /// Stops all services and persists state to disk.
 pub async fn stop_services(handles: ServiceHandles, state: &Arc<AppState>) {
+    if let Some(dbus) = handles.dbus {
+        dbus.stop().await;
+    }
     let timeout = std::time::Duration::from_secs(5);
     let _ = tokio::time::timeout(timeout, handles.discovery.listen_handle).await;
     if let Some(h) = handles.discovery.mdns_handle {

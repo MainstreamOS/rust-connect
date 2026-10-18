@@ -3,6 +3,7 @@
 //! Single Responsibility: Handle kdeconnect.sms packets.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use tracing::{info, trace};
@@ -11,6 +12,8 @@ use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
+mod attachments;
+pub use attachments::{request_packet as attachment_request_packet, AttachmentResult};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct SmsAddress {
@@ -23,7 +26,7 @@ pub struct SmsAddress {
 pub struct SmsMessage {
     #[serde(rename = "messageID")]
     pub message_id: Option<i64>,
-    #[serde(rename = "threadID", default)]
+    #[serde(rename = "threadID", alias = "thread_id", default)]
     pub thread_id: Option<i64>,
     #[serde(default)]
     pub addresses: Vec<SmsAddress>,
@@ -33,13 +36,13 @@ pub struct SmsMessage {
     pub date: Option<i64>,
     #[serde(rename = "type", default)]
     pub message_type: Option<i32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "read_flag")]
     pub read: Option<i32>,
-    #[serde(rename = "uID")]
+    #[serde(rename = "uID", alias = "_id")]
     pub uid: Option<i64>,
     #[serde(default)]
     pub event: Option<i32>,
-    #[serde(rename = "subscriptionID")]
+    #[serde(rename = "subscriptionID", alias = "sub_id")]
     pub subscription_id: Option<i32>,
     #[serde(rename = "attachments")]
     pub attachments: Option<Vec<serde_json::Value>>,
@@ -72,8 +75,48 @@ pub struct SmsMessagePayload {
     pub messages: Vec<SmsMessage>,
 }
 
+#[derive(Clone)]
 pub struct SmsPlugin {
     threads: Arc<StdRwLock<SmsThreadStore>>,
+    runtime: Option<SmsRuntime>,
+}
+
+#[derive(Clone)]
+struct SmsRuntime {
+    events: Arc<super::PluginEventBroadcaster>,
+    connections: Arc<crate::protocol::ConnectionManager>,
+    certificates: Arc<crate::protocol::CertificateManager>,
+    cache: PathBuf,
+    attachments: Arc<attachments::AttachmentQueue>,
+}
+
+/// Cancellation and timeouts must not leave partial private media behind.
+struct PartialAttachment(PathBuf);
+impl Drop for PartialAttachment {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+// Android serializes an integer today; older peers also used a boolean.
+fn read_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<i32>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Flag {
+        Number(i32),
+        Boolean(bool),
+    }
+    Ok(
+        <Option<Flag> as serde::Deserialize>::deserialize(d)?.map(|v| match v {
+            Flag::Number(n) => n,
+            Flag::Boolean(b) => i32::from(b),
+        }),
+    )
+}
+
+pub fn attachment_filename(identifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(identifier.as_bytes()))
 }
 
 impl Default for SmsPlugin {
@@ -86,7 +129,145 @@ impl SmsPlugin {
     pub fn new() -> Self {
         Self {
             threads: Arc::new(StdRwLock::new(HashMap::new())),
+            runtime: None,
         }
+    }
+
+    pub fn with_runtime(
+        mut self,
+        events: Arc<super::PluginEventBroadcaster>,
+        connections: Arc<crate::protocol::ConnectionManager>,
+        certificates: Arc<crate::protocol::CertificateManager>,
+        cache: PathBuf,
+    ) -> Self {
+        self.runtime = Some(SmsRuntime {
+            events,
+            connections,
+            certificates,
+            cache,
+            attachments: Arc::new(attachments::AttachmentQueue::new()),
+        });
+        self
+    }
+
+    pub fn attachment_path(&self, device: &str, identifier: &str) -> Option<PathBuf> {
+        let runtime = self.runtime.as_ref()?;
+        Some(
+            runtime
+                .cache
+                .join(attachment_filename(device))
+                .join(attachment_filename(identifier)),
+        )
+    }
+
+    async fn receive_attachment(&self, device: &str, packet: Packet) -> Result<PathBuf> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            crate::utils::errors::Error::InvalidRequest("SMS payload transport unavailable".into())
+        })?;
+        let identifier = packet
+            .body
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty() && v.len() <= 1024)
+            .ok_or_else(|| {
+                crate::utils::errors::Error::InvalidRequest("Missing attachment filename".into())
+            })?;
+        let size = packet
+            .payload_size
+            .and_then(crate::protocol::types::PayloadSize::known)
+            .filter(|n| *n <= 100 * 1024 * 1024)
+            .ok_or_else(|| {
+                crate::utils::errors::Error::InvalidRequest("Invalid attachment size".into())
+            })?;
+        let mut info: crate::protocol::payload_transfer::PayloadTransferInfo =
+            serde_json::from_value(packet.payload_transfer_info.ok_or_else(|| {
+                crate::utils::errors::Error::InvalidRequest("Missing payload endpoint".into())
+            })?)
+            .map_err(|e| crate::utils::errors::Error::InvalidRequest(e.to_string()))?;
+        let peer = runtime
+            .connections
+            .get_peer_addr(&device.to_string())
+            .await
+            .ok_or_else(|| {
+                crate::utils::errors::Error::InvalidRequest("Phone is disconnected".into())
+            })?;
+        // Always bind payload retrieval to the authenticated phone's address.
+        info.ip = Some(peer.ip().to_string());
+        let target = self.attachment_path(device, identifier).ok_or_else(|| {
+            crate::utils::errors::Error::InvalidRequest("SMS cache unavailable".into())
+        })?;
+        if let Some(parent) = target.parent() {
+            crate::utils::compat::private_directory(parent).await?;
+        }
+        let temporary = target.with_extension(uuid::Uuid::new_v4().simple().to_string());
+        let _partial = PartialAttachment(temporary.clone());
+        let transfer = crate::protocol::payload_transfer::PayloadTransfer::new(
+            runtime.certificates.clone(),
+            device.to_string(),
+        );
+        let result = transfer.receive_file(&info, size, &temporary).await;
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        crate::utils::compat::private_file(&temporary).await?;
+        tokio::fs::rename(&temporary, &target).await?;
+        if let Some(parent) = target.parent() {
+            Self::trim_attachment_cache(parent, &target).await?;
+        }
+        Ok(target)
+    }
+
+    async fn trim_attachment_cache(
+        directory: &std::path::Path,
+        keep: &std::path::Path,
+    ) -> Result<()> {
+        // Bounded per-phone disk use; original files can be fetched again.
+        let mut entries = tokio::fs::read_dir(directory).await?;
+        let mut files = Vec::new();
+        let mut bytes = 0u64;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_name().to_string_lossy().len() != 64 {
+                continue;
+            }
+            let metadata = entry.metadata().await?;
+            if metadata.is_file() {
+                bytes += metadata.len();
+                files.push((
+                    metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    entry.path(),
+                    metadata.len(),
+                ));
+            }
+        }
+        files.sort_by_key(|f| f.0);
+        let mut count = files.len();
+        for (_, path, size) in files {
+            if bytes <= 512 * 1024 * 1024 && count <= 1024 {
+                break;
+            }
+            if path != keep && tokio::fs::remove_file(path).await.is_ok() {
+                bytes -= size;
+                count -= 1;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn thread_ids(&self, device: &str) -> std::collections::HashSet<i64> {
+        self.threads
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter_map(|(id, thread)| (id == device).then_some(*thread))
+            .collect()
+    }
+    pub fn latest_message(&self, device: &str, thread: i64) -> Option<SmsMessage> {
+        self.threads
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(device.into(), thread))
+            .and_then(|messages| messages.last().cloned())
     }
 
     #[allow(clippy::expect_used)]
@@ -130,13 +311,18 @@ impl Plugin for SmsPlugin {
     }
 
     fn incoming_capabilities(&self) -> Vec<String> {
-        vec!["kdeconnect.sms.messages".to_string()]
+        vec![
+            "kdeconnect.sms.messages".to_string(),
+            "kdeconnect.sms.attachment_file".to_string(),
+        ]
     }
 
     fn outgoing_capabilities(&self) -> Vec<String> {
         vec![
             "kdeconnect.sms.request".to_string(),
             "kdeconnect.sms.request_conversations".to_string(),
+            "kdeconnect.sms.request_conversation".to_string(),
+            "kdeconnect.sms.request_attachment".to_string(),
         ]
     }
 
@@ -148,12 +334,22 @@ impl Plugin for SmsPlugin {
     }
 
     async fn on_disconnected(&self, device_id: &str) {
+        if let Some(runtime) = &self.runtime {
+            runtime.attachments.cancel_device(device_id);
+        }
         if let Ok(mut threads) = self.threads.write() {
             threads.retain(|(did, _), _| did != device_id);
         }
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
+        if packet.packet_type == "kdeconnect.sms.attachment_file" {
+            let runtime = self.runtime.as_ref().ok_or_else(|| {
+                crate::utils::Error::InvalidRequest("SMS payload transport unavailable".into())
+            })?;
+            runtime.attachments.deliver(device_id, packet)?;
+            return Ok(None);
+        }
         let messages: Vec<SmsMessage> = match packet.body_as("messages payload") {
             Ok(msgs) => msgs,
             Err(_) => {
@@ -169,6 +365,7 @@ impl Plugin for SmsPlugin {
             "Received SMS message batch"
         );
 
+        let mut changed = Vec::new();
         if let Ok(mut threads) = self.threads.write() {
             for msg in messages {
                 trace!(
@@ -194,8 +391,26 @@ impl Plugin for SmsPlugin {
                         }
                     }
                 }
+                let created = !threads.contains_key(&key);
                 let thread = threads.entry(key).or_default();
-                thread.push(msg);
+                let same = |old: &SmsMessage| match (
+                    old.uid.or(old.message_id),
+                    msg.uid.or(msg.message_id),
+                ) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => {
+                        old.date == msg.date
+                            && old.body == msg.body
+                            && old.message_type == msg.message_type
+                    }
+                };
+                if let Some(index) = thread.iter().position(same) {
+                    thread[index] = msg.clone();
+                } else {
+                    thread.push(msg.clone());
+                }
+                thread.sort_by_key(|m| (m.date.unwrap_or(0), m.uid.or(m.message_id).unwrap_or(0)));
+                changed.push((msg, created));
                 if thread.len() > MAX_SMS_MESSAGES_PER_THREAD {
                     let excess = thread.len() - MAX_SMS_MESSAGES_PER_THREAD;
                     thread.drain(..excess);
@@ -203,6 +418,20 @@ impl Plugin for SmsPlugin {
             }
         }
 
+        if let Some(runtime) = &self.runtime {
+            let created_threads = changed
+                .iter()
+                .filter(|(_, created)| *created)
+                .filter_map(|(message, _)| message.thread_id)
+                .collect();
+            runtime
+                .events
+                .broadcast(super::PluginEvent::SmsMessagesReceived {
+                    device_id: device_id.into(),
+                    messages: changed.into_iter().map(|(message, _)| message).collect(),
+                    created_threads,
+                });
+        }
         Ok(None)
     }
 }
