@@ -361,6 +361,34 @@ impl Conversations {
             .request_attachment(&self.device, part, identifier)
             .map_err(failure)
     }
+    /// Mainstream extension: drop a cached copy that failed to decode and fetch the file
+    /// from the phone again. `requestAttachmentFile` keeps returning a cached copy.
+    #[zbus(name = "refreshAttachmentFile")]
+    async fn refresh_attachment(&self, part: i64, identifier: &str) -> zbus::fdo::Result<()> {
+        if part < 0 || identifier.is_empty() || identifier.len() > 1024 {
+            return Err(failure("Invalid attachment identity"));
+        }
+        self.context.require_device(&self.device).await?;
+        if let Some(path) = self
+            .context
+            .app
+            .plugins
+            .sms
+            .attachment_path(&self.device, identifier)
+        {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(failure(error)),
+            }
+        }
+        self.context
+            .app
+            .plugins
+            .sms
+            .request_attachment(&self.device, part, identifier)
+            .map_err(failure)
+    }
     #[zbus(signal, name = "conversationCreated")]
     pub async fn created(
         emitter: &zbus::object_server::SignalEmitter<'_>,

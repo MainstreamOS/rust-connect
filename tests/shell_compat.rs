@@ -1183,6 +1183,71 @@ async fn respond_with_attachment(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refreshing_an_attachment_replaces_a_bad_cached_copy() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let bus = Bus::new();
+        let temp = tempfile::tempdir().unwrap();
+        let app = state(temp.path()).await;
+        let phone = loopback_phone(&app).await;
+        let _service = DBusService::on_connection(
+            app.clone(),
+            bus.connect(Some("org.kde.kdeconnect")).await,
+            temp.path().join("contacts"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let client = bus.connect(None).await;
+        let proxy = zbus::Proxy::new(
+            &client,
+            "org.kde.kdeconnect",
+            "/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "org.kde.kdeconnect.device.conversations",
+        )
+        .await
+        .unwrap();
+        let cached = app.plugins.sms.attachment_path(PHONE, "clip").unwrap();
+        tokio::fs::create_dir_all(cached.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&cached, b"corrupt").await.unwrap();
+        let mut received = proxy.receive_signal("attachmentReceived").await.unwrap();
+        // The normal request hands back the cached copy without asking the phone.
+        proxy
+            .call::<_, _, ()>("requestAttachmentFile", &(3i64, "clip"))
+            .await
+            .unwrap();
+        let signal = received.next().await.unwrap();
+        let (path, _): (String, String) = signal.body().deserialize().unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"corrupt");
+        assert!(tokio::time::timeout(
+            Duration::from_millis(80),
+            phone.manager.recv_packet(&DESKTOP.into())
+        )
+        .await
+        .is_err());
+        // A refresh drops the cached copy and asks the phone again.
+        proxy
+            .call::<_, _, ()>("refreshAttachmentFile", &(3i64, "clip"))
+            .await
+            .unwrap();
+        let packet = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
+        assert_eq!(packet.packet_type, "kdeconnect.sms.request_attachment");
+        assert_eq!(packet.body["unique_identifier"], "clip");
+        assert!(!cached.exists());
+        let file = temp.path().join("fresh.bin");
+        tokio::fs::write(&file, b"good bytes").await.unwrap();
+        respond_with_attachment(&app, &phone, &file, "clip", 10).await;
+        let signal = received.next().await.unwrap();
+        let (path, identifier): (String, String) = signal.body().deserialize().unwrap();
+        assert_eq!(identifier, "clip");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"good bytes");
+    })
+    .await
+    .expect("refresh must replace the cached copy");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_bursts_queue_before_requesting_and_failures_can_be_retried() {
     tokio::time::timeout(Duration::from_secs(20), exercise_attachment_queue())
         .await
