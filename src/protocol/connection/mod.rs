@@ -635,20 +635,20 @@ impl ConnectionManager {
     }
 
     /// Write one serialized packet and flush it, each half bounded by a
-    /// short timeout so a stalled peer cannot wedge every plugin behind
-    /// the write lock. Any error means the bytes on the wire are not a
-    /// complete line — the caller tears the link down.
+    /// bounded timeout so a stalled peer cannot wedge every plugin behind
+    /// the write lock. Allow Wi-Fi backpressure and larger clipboard or SMS
+    /// packets: a 100 ms budget disconnects healthy phones during sync.
+    /// Any error means the bytes on the wire are not a complete line — the
+    /// caller tears the link down.
     async fn write_framed<W: tokio::io::AsyncWrite + Unpin>(
         write_stream: &mut W,
         bytes: &[u8],
         device_id: &DeviceId,
     ) -> Result<()> {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            write_stream.write_all(bytes),
-        )
-        .await
-        {
+        // Budget roughly 256 KiB/s for larger packets, with a fixed upper
+        // bound so a peer that stops reading still releases the write lock.
+        let write_timeout = Duration::from_secs(5 + (bytes.len() as u64 / (256 * 1024)).min(25));
+        match tokio::time::timeout(write_timeout, write_stream.write_all(bytes)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 error!(
@@ -680,9 +680,7 @@ impl ConnectionManager {
             event = "write_all_complete",
             "write_all completed successfully, flushing..."
         );
-        match tokio::time::timeout(std::time::Duration::from_millis(100), write_stream.flush())
-            .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), write_stream.flush()).await {
             Ok(Ok(())) => {
                 trace!(device_id = %device_id, event = "flush_complete", "Flush completed");
                 Ok(())

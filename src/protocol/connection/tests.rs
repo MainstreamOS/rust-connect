@@ -127,7 +127,30 @@ async fn test_connect_and_communicate() {
     let _ = server_handle.await;
 }
 
-/// A3 (2026-09-02 audit): `send_packet` bounds `write_all` with a short
+#[tokio::test]
+async fn test_send_tolerates_brief_peer_backpressure() {
+    use tokio::io::AsyncReadExt;
+
+    let (mut writer, mut reader) = tokio::io::duplex(64);
+    let bytes = b"{\"type\":\"kdeconnect.test\"}\n".repeat(1024);
+    let receive = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut received = Vec::new();
+        reader
+            .read_to_end(&mut received)
+            .await
+            .expect("receive the complete packet after backpressure clears");
+        received
+    });
+
+    ConnectionManager::write_framed(&mut writer, &bytes, &"test-phone".to_string())
+        .await
+        .expect("brief backpressure must not disconnect a healthy peer");
+    drop(writer);
+    assert_eq!(receive.await.expect("receiver task completes"), bytes);
+}
+
+/// A3 (2026-09-02 audit): `send_packet` bounds `write_all` with a
 /// timeout. tokio-rustls hands back partial counts under backpressure, so a
 /// timed-out write leaves part of the packet queued and the rest never
 /// written; the next packet on the same stream lands after the truncated
