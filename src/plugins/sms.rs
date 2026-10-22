@@ -367,7 +367,7 @@ impl Plugin for SmsPlugin {
 
         let mut changed = Vec::new();
         if let Ok(mut threads) = self.threads.write() {
-            for msg in messages {
+            for mut msg in messages {
                 trace!(
                     thread_id = msg.thread_id.unwrap_or(0),
                     event = "sms_received",
@@ -405,6 +405,20 @@ impl Plugin for SmsPlugin {
                     }
                 };
                 if let Some(index) = thread.iter().position(same) {
+                    // An omitted field in a status/enrichment update is not a
+                    // request to erase the original body or attachment identity.
+                    // Explicit empty bodies/attachment lists still replace their values.
+                    let old = &thread[index];
+                    msg.body = msg.body.or_else(|| old.body.clone());
+                    msg.attachments = msg.attachments.or_else(|| old.attachments.clone());
+                    if msg.addresses.is_empty() {
+                        msg.addresses = old.addresses.clone();
+                    }
+                    msg.date = msg.date.or(old.date);
+                    msg.message_type = msg.message_type.or(old.message_type);
+                    msg.event = msg.event.or(old.event);
+                    msg.subscription_id = msg.subscription_id.or(old.subscription_id);
+                    msg.read = msg.read.or(old.read);
                     thread[index] = msg.clone();
                 } else {
                     thread.push(msg.clone());
@@ -471,6 +485,94 @@ mod tests {
         let thread = plugin.get_thread("test", 100);
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].body.as_deref(), Some("Hello"));
+    }
+
+    #[tokio::test]
+    async fn media_updates_and_replays_preserve_record_identity() {
+        let plugin = SmsPlugin::new();
+        let packet = |messages: serde_json::Value| {
+            Packet::new(
+                "kdeconnect.sms.messages".into(),
+                serde_json::json!({"version": 2, "messages": messages}),
+            )
+        };
+        // Real phone structure: a caption and media can be distinct MMS records
+        // with different dates. Never deduplicate different IDs by proximity.
+        for mime in [
+            "image/jpeg",
+            "image/gif",
+            "audio/amr",
+            "video/mp4",
+            "application/pdf",
+        ] {
+            let messages = serde_json::json!([
+                {"_id": 1075, "thread_id": 63, "date": 1792633343000i64, "type": 1,
+                 "event": 3, "body": "caption", "addresses": [{"address": "+15555550123"}], "attachments": []},
+                {"_id": 1076, "thread_id": 63, "date": 1792633344000i64, "type": 1,
+                 "event": 2, "body": "", "addresses": [{"address": "+15555550123"}],
+                 "attachments": [{"part_id": 1439, "mime_type": mime, "unique_identifier": "part-1439", "encoded_thumbnail": ""}]}
+            ]);
+            for _ in 0..3 {
+                plugin
+                    .handle_packet("phone", packet(messages.clone()))
+                    .await
+                    .unwrap();
+            }
+            plugin
+                .handle_packet(
+                    "phone",
+                    packet(serde_json::json!([
+                        {"_id": 1076, "thread_id": 63, "read": 1}
+                    ])),
+                )
+                .await
+                .unwrap();
+            let stored = plugin.get_thread("phone", 63);
+            assert_eq!(stored.len(), 2);
+            assert_eq!(stored[0].body.as_deref(), Some("caption"));
+            assert_eq!(stored[1].uid, Some(1076));
+            assert_eq!(stored[1].date, Some(1792633344000));
+            assert_eq!(stored[1].read, Some(1));
+            assert_eq!(stored[1].event, Some(2));
+            assert_eq!(
+                stored[1].addresses[0].address.as_deref(),
+                Some("+15555550123")
+            );
+            let variant = crate::dbus::conversations::Message::try_from(&stored[1]).unwrap();
+            assert_eq!(variant.attachments[0].mime, mime);
+            assert_eq!(variant.attachments[0].part, 1439);
+            assert_eq!(variant.attachments[0].identifier, "part-1439");
+        }
+        // An authoritative empty list is different from an omitted list.
+        plugin
+            .handle_packet(
+                "phone",
+                packet(serde_json::json!([
+                    {"_id": 1076, "thread_id": 63, "attachments": [], "body": "removed"}
+                ])),
+            )
+            .await
+            .unwrap();
+        assert!(plugin.get_thread("phone", 63)[1]
+            .attachments
+            .as_ref()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            plugin.get_thread("phone", 63)[1].body.as_deref(),
+            Some("removed")
+        );
+        plugin
+            .handle_packet(
+                "other-phone",
+                packet(serde_json::json!([
+                    {"_id": 1075, "thread_id": 63, "date": 1792633343000i64, "body": "other phone"}
+                ])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plugin.get_thread("other-phone", 63).len(), 1);
+        assert_eq!(plugin.get_thread("phone", 63).len(), 2);
     }
 
     #[tokio::test]

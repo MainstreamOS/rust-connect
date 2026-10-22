@@ -156,6 +156,7 @@ async fn real_conversation_signals_and_variants_preserve_android_history() {
     .await
     .unwrap();
     let mut completed = proxy.receive_signal("conversationLoaded").await.unwrap();
+    let mut updated = proxy.receive_signal("conversationUpdated").await.unwrap();
     let body: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/upstream-wire/sms/android_v2_batch.json"
     ))
@@ -192,6 +193,37 @@ async fn real_conversation_signals_and_variants_preserve_android_history() {
         .sms
         .get_thread("phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa", 42);
     assert_eq!(messages[0].uid, Some(74));
+    // A read-status update may omit the attachment metadata. The shell must
+    // receive the complete original record, rather than a blank media message.
+    app.plugins
+        .sms
+        .handle_packet(
+            "phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Packet::new(
+                "kdeconnect.sms.messages".into(),
+                serde_json::json!({"messages":[
+                    {"thread_id":42,"_id":75,"read":1}
+                ]}),
+            ),
+        )
+        .await
+        .unwrap();
+    let enriched = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let signal = updated.next().await.unwrap();
+            let (value,): (OwnedValue,) = signal.body().deserialize().unwrap();
+            let message = Message::try_from(value).unwrap();
+            if message.uid == 75 && message.read == 1 {
+                break message;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(enriched.body, "A newer message");
+    assert_eq!(enriched.date, 1700000002000);
+    assert_eq!(enriched.attachments[0].identifier, "voice-note.amr");
+    assert_eq!(enriched.addresses[0].address, "+15550000001");
     let failed: Result<(), _> = proxy
         .call(
             "sendWithoutConversation",
