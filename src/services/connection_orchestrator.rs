@@ -137,9 +137,8 @@ async fn run_connection_sequence(
     .await
 }
 
-/// Removes a device id from `ConnectionManager::pending_connections` when
-/// dropped, so every exit path of a dial — success, error, panic — releases
-/// the in-flight marker. Shared by the discovery dial and the reconnect loop
+/// Releases a per-device in-flight marker on every exit path, including
+/// cancellation and panic. Shared by dials and the lifetime of retry loops
 /// (2026-09-02 audit, C1b: the reconnect loop never registered, so a
 /// discovery event could dial the same device concurrently).
 struct PendingGuard {
@@ -156,22 +155,39 @@ impl Drop for PendingGuard {
     }
 }
 
-/// Reconnect loop with exponential backoff.
+/// Reconnect paired devices with exponential backoff, including after the
+/// initial burst of retries. Only one retry loop per device may stay alive.
 async fn reconnect_loop(
     state: Arc<AppState>,
     identity: Identity,
     addr: SocketAddr,
     device_id: String,
 ) {
-    let max_retries: u32 = 5;
+    let pending = state.connection_manager.reconnecting_devices.clone();
+    if !pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(device_id.clone())
+    {
+        return;
+    }
+    let _reconnect_guard = PendingGuard {
+        pending,
+        id: device_id.clone(),
+    };
+    let mut attempt = 0u32;
 
-    for attempt in 1..=max_retries {
+    loop {
         if state.shutdown.is_cancelled() {
+            return;
+        }
+        attempt = attempt.saturating_add(1);
+        if attempt > 5 && !state.pairing_handler.is_paired(&device_id).await {
             return;
         }
 
         let delay = backoff_delay(
-            attempt,
+            attempt.min(6),
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(30),
         );
@@ -179,7 +195,6 @@ async fn reconnect_loop(
         info!(
             device_id = %device_id,
             attempt = attempt,
-            max_retries = max_retries,
             delay_secs = delay.as_secs(),
             event = "reconnect_attempt",
             "Attempting reconnection with exponential backoff"
@@ -237,6 +252,7 @@ async fn reconnect_loop(
                     "Successfully reconnected to device"
                 );
 
+                let connected_at = tokio::time::Instant::now();
                 let result = run_connection_sequence(
                     state.clone(),
                     connected_id.clone(),
@@ -247,8 +263,11 @@ async fn reconnect_loop(
 
                 if matches!(result, LoopResult::Disconnected)
                     && !state.shutdown.is_cancelled()
-                    && attempt < max_retries
+                    && state.pairing_handler.is_paired(&connected_id).await
                 {
+                    if connected_at.elapsed() >= std::time::Duration::from_secs(30) {
+                        attempt = 0;
+                    }
                     continue;
                 }
                 return;
@@ -264,12 +283,6 @@ async fn reconnect_loop(
             }
         }
     }
-
-    warn!(
-        device_id = %device_id,
-        event = "reconnect_exhausted",
-        "Exhausted reconnection attempts"
-    );
 }
 
 /// Spawns a connection task for a discovered device.
@@ -604,6 +617,79 @@ mod tests {
             .await
             .expect("reconnect loop must exit promptly on shutdown during backoff")
             .expect("Value expected to be present");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_paired_phone_keeps_retrying_after_initial_failures() {
+        let (state, _t) = test_state();
+        state
+            .registry
+            .add(crate::device::Device::new(
+                PEER_ID.to_string(),
+                "Peer".to_string(),
+                crate::device::types::DeviceType::Phone,
+                8,
+            ))
+            .await
+            .unwrap();
+        state
+            .pairing_handler
+            .set_pending_peer_cert(&PEER_ID.to_string(), make_external_cert_der(PEER_ID))
+            .await;
+        state
+            .pairing_handler
+            .force_accept_pairing(&PEER_ID.to_string())
+            .await
+            .unwrap();
+
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            reconnect_loop(
+                task_state,
+                peer_identity(),
+                "127.0.0.1:1".parse().unwrap(),
+                PEER_ID.to_string(),
+            )
+            .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        assert!(
+            !task.is_finished(),
+            "a paired phone must not be abandoned after five failures"
+        );
+        state.shutdown.cancel();
+        task.await.unwrap();
+        assert!(state
+            .connection_manager
+            .reconnecting_devices
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reconnect_loops_are_deduplicated_and_release_on_shutdown() {
+        let (state, _t) = test_state();
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            reconnect_loop(first_state, peer_identity(), addr, PEER_ID.to_string()).await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reconnect_loop(state.clone(), peer_identity(), addr, PEER_ID.to_string()),
+        )
+        .await
+        .expect("another discovery event must not create a competing retry loop");
+        state.shutdown.cancel();
+        first.await.unwrap();
+        assert!(state
+            .connection_manager
+            .reconnecting_devices
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     /// Lane-C repro (audit-2026-09-02-remaining-brief.md, section C, lead

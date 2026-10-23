@@ -150,7 +150,39 @@ async fn test_send_tolerates_brief_peer_backpressure() {
     assert_eq!(receive.await.expect("receiver task completes"), bytes);
 }
 
-/// A3 (2026-09-02 audit): `send_packet` bounds `write_all` with a
+#[tokio::test(start_paused = true)]
+async fn test_packet_write_survives_transient_backpressure() {
+    use tokio::io::AsyncReadExt;
+
+    let (mut writer, mut reader) = tokio::io::duplex(8);
+    let bytes = b"a packet that does not fit in the initial socket buffer\n";
+    let receiving = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        received
+    });
+
+    ConnectionManager::write_framed(&mut writer, bytes, &"slow-phone".to_string())
+        .await
+        .expect("a phone briefly pausing its reads must not lose the connection");
+    drop(writer);
+    assert_eq!(receiving.await.unwrap(), bytes);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_packet_write_to_stalled_peer_remains_bounded() {
+    let (mut writer, _reader) = tokio::io::duplex(1);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(11),
+        ConnectionManager::write_framed(&mut writer, b"blocked\n", &"stalled-phone".to_string()),
+    )
+    .await
+    .expect("the packet send must not hang indefinitely");
+    assert!(matches!(result, Err(Error::ConnectionTimeout(_))));
+}
+
+/// A3 (2026-09-02 audit): `send_packet` bounds `write_all` with a finite
 /// timeout. tokio-rustls hands back partial counts under backpressure, so a
 /// timed-out write leaves part of the packet queued and the rest never
 /// written; the next packet on the same stream lands after the truncated

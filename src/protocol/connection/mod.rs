@@ -44,6 +44,7 @@ pub struct ConnectionManager {
     /// recovers the peer, which is the case vk #1101 exists to fix.
     pub(crate) last_mdns_unicast: Arc<RwLock<HashMap<String, Instant>>>,
     pub pending_connections: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
+    pub(crate) reconnecting_devices: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
     pub(crate) cert_manager: Arc<CertificateManager>,
     pub(crate) device_id: Arc<std::sync::RwLock<String>>,
     pub(crate) device_name: Arc<std::sync::RwLock<String>>,
@@ -111,6 +112,9 @@ pub(crate) const MAX_STEADY_PACKET_SIZE: usize = 32 * 1024 * 1024;
 /// redial scenarios off the real value instead of guessing a sleep
 /// duration that silently drifts from it.
 pub const CONNECTION_RATE_LIMIT: Duration = Duration::from_millis(1000);
+// A phone can pause reads during history sync or radio power saving. Keep
+// writes bounded without treating a normal subsecond pause as a broken link.
+const PACKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Read one `\n`-delimited packet line, enforcing `max_len` DURING the read
 /// rather than after it: as soon as the accumulated bytes would exceed the
@@ -227,6 +231,7 @@ impl ConnectionManager {
             last_connection_attempt: Arc::new(RwLock::new(HashMap::new())),
             last_mdns_unicast: Arc::new(RwLock::new(HashMap::new())),
             pending_connections: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            reconnecting_devices: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             cert_manager,
             device_id: Arc::new(std::sync::RwLock::new(String::new())),
             device_name: Arc::new(std::sync::RwLock::new("Rust Connect".to_string())),
@@ -624,6 +629,7 @@ impl ConnectionManager {
                 // connections lock and then this same write lock.
                 warn!(
                     device_id = %device_id,
+                    packet_type = %packet.packet_type,
                     error = %e,
                     event = "send_failure_teardown",
                     "Send failed; tearing the link down (stream framing undefined)"
@@ -634,21 +640,17 @@ impl ConnectionManager {
         }
     }
 
-    /// Write one serialized packet and flush it, each half bounded by a
-    /// bounded timeout so a stalled peer cannot wedge every plugin behind
-    /// the write lock. Allow Wi-Fi backpressure and larger clipboard or SMS
-    /// packets: a 100 ms budget disconnects healthy phones during sync.
-    /// Any error means the bytes on the wire are not a complete line — the
-    /// caller tears the link down.
+    /// Write one serialized packet and flush it within one deadline,
+    /// so a stalled peer cannot wedge every plugin behind
+    /// the write lock. Any error means the bytes on the wire are not a
+    /// complete line — the caller tears the link down.
     async fn write_framed<W: tokio::io::AsyncWrite + Unpin>(
         write_stream: &mut W,
         bytes: &[u8],
         device_id: &DeviceId,
     ) -> Result<()> {
-        // Budget roughly 256 KiB/s for larger packets, with a fixed upper
-        // bound so a peer that stops reading still releases the write lock.
-        let write_timeout = Duration::from_secs(5 + (bytes.len() as u64 / (256 * 1024)).min(25));
-        match tokio::time::timeout(write_timeout, write_stream.write_all(bytes)).await {
+        let deadline = tokio::time::Instant::now() + PACKET_WRITE_TIMEOUT;
+        match tokio::time::timeout_at(deadline, write_stream.write_all(bytes)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 error!(
@@ -680,7 +682,7 @@ impl ConnectionManager {
             event = "write_all_complete",
             "write_all completed successfully, flushing..."
         );
-        match tokio::time::timeout(std::time::Duration::from_secs(5), write_stream.flush()).await {
+        match tokio::time::timeout_at(deadline, write_stream.flush()).await {
             Ok(Ok(())) => {
                 trace!(device_id = %device_id, event = "flush_complete", "Flush completed");
                 Ok(())
