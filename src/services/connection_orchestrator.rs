@@ -291,40 +291,53 @@ async fn reconnect_loop(
 /// discovery left phones offline for that long. Whoever receives a UDP
 /// identity dials its sender (see `protocol::udp_unicast`), so this keeps
 /// sending ours to the phone's last address with the reconnect backoff
-/// until it is back, unpaired, or the daemon stops. It shares the reconnect
-/// loop's per-device slot, so only one of the two runs for a device.
+/// until it is back, unpaired, or the daemon stops. One loop runs per phone;
+/// a later drop only points it at the phone's new address.
 pub(crate) fn spawn_dial_back_requests(
     state: Arc<AppState>,
     device_id: String,
     peer_ip: std::net::IpAddr,
 ) {
-    tokio::spawn(request_dial_back_loop(
-        state,
-        device_id,
-        peer_ip,
-        crate::protocol::types::fallback_udp_port(),
-    ));
+    if register_dial_back(&state, &device_id, peer_ip) {
+        tokio::spawn(request_dial_back_loop(
+            state,
+            device_id,
+            crate::protocol::types::fallback_udp_port(),
+        ));
+    }
 }
 
-async fn request_dial_back_loop(
-    state: Arc<AppState>,
-    device_id: String,
-    peer_ip: std::net::IpAddr,
-    udp_port: u16,
-) {
-    let pending = state.connection_manager.reconnecting_devices.clone();
-    if !pending
+/// Point the phone's dial-back requests at `peer_ip`. True when no loop runs
+/// for it yet, so the caller starts one.
+fn register_dial_back(state: &AppState, device_id: &str, peer_ip: std::net::IpAddr) -> bool {
+    let mut targets = state
+        .connection_manager
+        .dial_back_targets
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(device_id.clone())
-    {
-        return;
+        .unwrap_or_else(|e| e.into_inner());
+    match targets.get_mut(device_id) {
+        Some(target) => {
+            *target = (peer_ip, target.1 + 1);
+            false
+        }
+        None => {
+            targets.insert(device_id.to_string(), (peer_ip, 0));
+            true
+        }
     }
-    let _guard = PendingGuard {
-        pending,
-        id: device_id.clone(),
+}
+
+async fn request_dial_back_loop(state: Arc<AppState>, device_id: String, udp_port: u16) {
+    let targets = state.connection_manager.dial_back_targets.clone();
+    let target = || {
+        targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&device_id)
+            .copied()
     };
     let mut attempt = 0u32;
+    let mut seen = target().map(|(_, generation)| generation);
     loop {
         attempt = attempt.saturating_add(1);
         let delay = backoff_delay(
@@ -334,15 +347,36 @@ async fn request_dial_back_loop(
         );
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
-            _ = state.shutdown.cancelled() => return,
+            _ = state.shutdown.cancelled() => {
+                targets.lock().unwrap_or_else(|e| e.into_inner()).remove(&device_id);
+                return;
+            }
+        }
+        let Some((peer_ip, generation)) = target() else {
+            return;
+        };
+        // A new drop sent the phone elsewhere; start again from the short delay.
+        if Some(generation) != seen {
+            seen = Some(generation);
+            attempt = 0;
         }
         if state.shutdown.is_cancelled()
             || state.connection_manager.is_connected(&device_id).await
             || !state.pairing_handler.is_paired(&device_id).await
         {
-            return;
+            let mut current = targets.lock().unwrap_or_else(|e| e.into_inner());
+            // Stop only if no drop updated the target meanwhile.
+            if current.get(&device_id).map(|(_, g)| *g) == Some(generation) {
+                current.remove(&device_id);
+                return;
+            }
+            continue;
         }
         let Some(our_identity) = state.connection_manager.get_identity() else {
+            targets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&device_id);
             return;
         };
         match crate::protocol::udp_unicast::unicast_identity(&our_identity, peer_ip, udp_port).await
@@ -794,16 +828,29 @@ mod tests {
             .unwrap();
     }
 
+    fn no_dial_backs(state: &AppState) -> bool {
+        state
+            .connection_manager
+            .dial_back_targets
+            .lock()
+            .unwrap()
+            .is_empty()
+    }
+
     #[tokio::test]
     async fn test_dropped_inbound_phone_is_asked_to_dial_back() {
         let (state, _t) = test_state();
         pair_peer(&state).await;
         let phone = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = phone.local_addr().unwrap().port();
+        assert!(register_dial_back(
+            &state,
+            PEER_ID,
+            "127.0.0.1".parse().unwrap()
+        ));
         let task = tokio::spawn(request_dial_back_loop(
             state.clone(),
             PEER_ID.to_string(),
-            "127.0.0.1".parse().unwrap(),
             port,
         ));
         let mut buf = vec![0u8; 65536];
@@ -817,34 +864,56 @@ mod tests {
         assert!(datagram.contains(OUR_ID));
         state.shutdown.cancel();
         task.await.unwrap();
-        assert!(state
-            .connection_manager
-            .reconnecting_devices
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(no_dial_backs(&state));
+    }
+
+    #[tokio::test]
+    async fn test_a_later_drop_moves_the_running_dial_back_to_the_new_address() {
+        let (state, _t) = test_state();
+        pair_peer(&state).await;
+        let moved = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let port = moved.local_addr().unwrap().port();
+        assert!(register_dial_back(
+            &state,
+            PEER_ID,
+            "127.0.0.1".parse().unwrap()
+        ));
+        let task = tokio::spawn(request_dial_back_loop(
+            state.clone(),
+            PEER_ID.to_string(),
+            port,
+        ));
+        // The phone came back briefly at another address and dropped again.
+        assert!(!register_dial_back(
+            &state,
+            PEER_ID,
+            "127.0.0.2".parse().unwrap()
+        ));
+        let mut buf = vec![0u8; 65536];
+        tokio::time::timeout(std::time::Duration::from_secs(5), moved.recv_from(&mut buf))
+            .await
+            .expect("the running loop must follow the phone to its new address")
+            .unwrap();
+        state.shutdown.cancel();
+        task.await.unwrap();
+        assert!(no_dial_backs(&state));
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_dial_back_requests_stop_for_an_unpaired_phone() {
         let (state, _t) = test_state();
+        assert!(register_dial_back(
+            &state,
+            PEER_ID,
+            "127.0.0.1".parse().unwrap()
+        ));
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            request_dial_back_loop(
-                state.clone(),
-                PEER_ID.to_string(),
-                "127.0.0.1".parse().unwrap(),
-                9,
-            ),
+            request_dial_back_loop(state.clone(), PEER_ID.to_string(), 9),
         )
         .await
         .expect("an unpaired phone must not keep being asked to dial back");
-        assert!(state
-            .connection_manager
-            .reconnecting_devices
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(no_dial_backs(&state));
     }
 
     /// Lane-C repro (audit-2026-09-02-remaining-brief.md, section C, lead

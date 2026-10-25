@@ -45,6 +45,9 @@ pub struct ConnectionManager {
     pub(crate) last_mdns_unicast: Arc<RwLock<HashMap<String, Instant>>>,
     pub pending_connections: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
     pub(crate) reconnecting_devices: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
+    /// Where each dropped phone is asked to dial back, with a count of how often
+    /// a new drop has updated it (see `connection_orchestrator::spawn_dial_back_requests`).
+    pub(crate) dial_back_targets: Arc<std::sync::Mutex<HashMap<DeviceId, (std::net::IpAddr, u64)>>>,
     pub(crate) cert_manager: Arc<CertificateManager>,
     pub(crate) device_id: Arc<std::sync::RwLock<String>>,
     pub(crate) device_name: Arc<std::sync::RwLock<String>>,
@@ -232,6 +235,7 @@ impl ConnectionManager {
             last_mdns_unicast: Arc::new(RwLock::new(HashMap::new())),
             pending_connections: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             reconnecting_devices: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            dial_back_targets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cert_manager,
             device_id: Arc::new(std::sync::RwLock::new(String::new())),
             device_name: Arc::new(std::sync::RwLock::new("Rust Connect".to_string())),
