@@ -11,7 +11,10 @@ use crate::{
     app::AppState,
     device::DeviceEvent,
     plugins::{sms::SmsMessage, PluginEvent},
-    protocol::types::Packet,
+    protocol::{
+        pairing::{PairState, PAIR_ACCEPT_TIMEOUT_SECS, PAIR_REQUEST_TIMEOUT_SECS},
+        types::Packet,
+    },
     utils::compat,
 };
 use futures::StreamExt;
@@ -451,35 +454,15 @@ impl Context {
                 &(paired,),
             )
             .await?;
-            let pair_state =
-                devices::pair_state_number(self.app.pairing_handler.pair_state(&device).await);
-            self.emit(
-                &device,
-                "org.kde.kdeconnect.device",
-                "pairStateChanged",
-                &(pair_state,),
-            )
-            .await?;
+            self.pair_state_changed(&device).await?;
             let properties = HashMap::from([
                 ("isReachable", OwnedValue::from(value.is_connected())),
-                ("isPaired", OwnedValue::from(paired)),
-                ("pairState", OwnedValue::from(pair_state)),
                 (
                     "name",
                     OwnedValue::from(zbus::zvariant::Str::from(value.name.as_str())),
                 ),
             ]);
-            self.emit_at(
-                &Self::path(&device),
-                "org.freedesktop.DBus.Properties",
-                "PropertiesChanged",
-                &(
-                    "org.kde.kdeconnect.device",
-                    properties,
-                    Vec::<String>::new(),
-                ),
-            )
-            .await?;
+            self.device_properties_changed(&device, properties).await?;
             self.emit_at(
                 ROOT,
                 "org.kde.kdeconnect.daemon",
@@ -489,6 +472,78 @@ impl Context {
             .await?;
         }
         Ok(())
+    }
+
+    /// Tells clients the pairing state and the properties that follow it, and
+    /// tells them again if a pending request lapses unanswered.
+    pub(crate) async fn pair_state_changed(self: &Arc<Self>, device: &str) -> zbus::Result<()> {
+        let state = self.emit_pair_state(device).await?;
+        let timeout = match state {
+            PairState::Requested => PAIR_REQUEST_TIMEOUT_SECS,
+            PairState::RequestedByPeer => PAIR_ACCEPT_TIMEOUT_SECS,
+            _ => return Ok(()),
+        };
+        let context = self.clone();
+        let device = device.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(timeout as u64 + 1)).await;
+            if context.app.pairing_handler.pair_state(&device).await == PairState::NotPaired {
+                let _ = context.emit_pair_state(&device).await;
+            }
+        });
+        Ok(())
+    }
+
+    async fn emit_pair_state(&self, device: &str) -> zbus::Result<PairState> {
+        let pairing = &self.app.pairing_handler;
+        let id = device.to_string();
+        let state = pairing.pair_state(&id).await;
+        let number = devices::pair_state_number(state);
+        self.emit(
+            device,
+            "org.kde.kdeconnect.device",
+            "pairStateChanged",
+            &(number,),
+        )
+        .await?;
+        let key = pairing
+            .get_verification_key(&id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let properties = HashMap::from([
+            ("pairState", OwnedValue::from(number)),
+            ("isPaired", OwnedValue::from(state == PairState::Paired)),
+            (
+                "isPairRequestedByPeer",
+                OwnedValue::from(state == PairState::RequestedByPeer),
+            ),
+            (
+                "verificationKey",
+                OwnedValue::from(zbus::zvariant::Str::from(key)),
+            ),
+        ]);
+        self.device_properties_changed(device, properties).await?;
+        Ok(state)
+    }
+
+    async fn device_properties_changed(
+        &self,
+        device: &str,
+        properties: HashMap<&str, OwnedValue>,
+    ) -> zbus::Result<()> {
+        self.emit_at(
+            &Self::path(device),
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &(
+                "org.kde.kdeconnect.device",
+                properties,
+                Vec::<String>::new(),
+            ),
+        )
+        .await
     }
 
     async fn forget_device(self: &Arc<Self>, device: &str) {

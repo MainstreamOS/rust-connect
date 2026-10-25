@@ -1969,6 +1969,20 @@ async fn a_phone_asking_to_pair_can_be_accepted_or_declined_over_dbus() {
             .build()
             .await
             .unwrap();
+        // Cached, as most clients are, so it relies on PropertiesChanged.
+        let cached: zbus::Proxy = zbus::proxy::Builder::new(&client)
+            .destination("org.kde.kdeconnect")
+            .unwrap()
+            .path("/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap()
+            .interface("org.kde.kdeconnect.device")
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut requested = cached
+            .receive_property_changed::<bool>("isPairRequestedByPeer")
+            .await;
         let mut states = device.receive_signal("pairStateChanged").await.unwrap();
         let ask = || async {
             let certificate = app
@@ -2005,6 +2019,22 @@ async fn a_phone_asking_to_pair_can_be_accepted_or_declined_over_dbus() {
             .await
             .unwrap();
         assert_eq!(key.len(), 8, "verification key {key:?}");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(change) = requested.next().await {
+                if change.get().await.unwrap() {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cached
+                .cached_property::<String>("verificationKey")
+                .unwrap()
+                .unwrap(),
+            key
+        );
         device.call::<_, _, ()>("acceptPairing", &()).await.unwrap();
         let answer = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
         assert_eq!(answer.packet_type, "kdeconnect.pair");
@@ -2031,6 +2061,26 @@ async fn a_phone_asking_to_pair_can_be_accepted_or_declined_over_dbus() {
             .await
             .unwrap());
         assert!(device.call::<_, _, ()>("acceptPairing", &()).await.is_err());
+
+        // Pairing started here asks the phone and shows as requested.
+        device.call::<_, _, ()>("requestPair", &()).await.unwrap();
+        loop {
+            let packet = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
+            if packet.packet_type == "kdeconnect.pair" {
+                assert_eq!(packet.body["pair"], true);
+                break;
+            }
+        }
+        assert_eq!(next_pair_state(&mut states).await, 1);
+        device.call::<_, _, ()>("cancelPairing", &()).await.unwrap();
+        loop {
+            let packet = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
+            if packet.packet_type == "kdeconnect.pair" {
+                assert_eq!(packet.body["pair"], false);
+                break;
+            }
+        }
+        assert_eq!(next_pair_state(&mut states).await, 0);
 
         // The Mainstream shell's bridge reports the request and answers it.
         if let Some(script) = std::env::var_os("MAINSTREAM_PHONE_BRIDGE") {

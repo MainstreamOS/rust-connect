@@ -172,13 +172,21 @@ impl DeviceApi {
                 .initiate_pairing(&self.device)
                 .await
                 .map_err(failure)?;
-            self.context
+            if let Err(e) = self
+                .context
                 .app
                 .connection_manager
                 .send_packet(
                     &self.device,
                     &Packet::pair_request_with_timestamp(timestamp),
                 )
+                .await
+            {
+                let _ = pairing.reject_pairing(&self.device).await;
+                return Err(failure(e));
+            }
+            self.context
+                .pair_state_changed(&self.device)
                 .await
                 .map_err(failure)?;
         }
@@ -218,12 +226,7 @@ impl DeviceApi {
         }
         let _ = app.pairing_handler.reject_pairing(&self.device).await;
         self.context
-            .emit(
-                &self.device,
-                "org.kde.kdeconnect.device",
-                "pairStateChanged",
-                &(pair_state_number(PairState::NotPaired),),
-            )
+            .pair_state_changed(&self.device)
             .await
             .map_err(failure)
     }
