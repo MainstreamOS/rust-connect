@@ -1,5 +1,9 @@
 use super::{failure, Context};
-use crate::{device::Device, protocol::types::Packet, utils::compat::component};
+use crate::{
+    device::Device,
+    protocol::{pairing::PairState, types::Packet},
+    utils::compat::component,
+};
 use std::sync::Arc;
 use zbus::interface;
 
@@ -121,45 +125,48 @@ impl DeviceApi {
             .iter()
             .any(|p| p == plugin || p.strip_prefix("kdeconnect_") == Some(plugin))
     }
+    /// KDE's PairState numbering: not paired, requested by us, requested by
+    /// the phone, paired.
+    #[zbus(property, name = "pairState")]
+    async fn pair_state(&self) -> i32 {
+        pair_state_number(
+            self.context
+                .app
+                .pairing_handler
+                .pair_state(&self.device)
+                .await,
+        )
+    }
+    #[zbus(property, name = "isPairRequestedByPeer")]
+    async fn pair_requested_by_peer(&self) -> bool {
+        self.context
+            .app
+            .pairing_handler
+            .has_incoming_request(&self.device)
+            .await
+    }
+    /// The code both screens show while a pairing request is pending, empty otherwise.
+    #[zbus(property, name = "verificationKey")]
+    async fn verification_key(&self) -> String {
+        self.context
+            .app
+            .pairing_handler
+            .get_verification_key(&self.device)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
     #[zbus(name = "requestPair")]
     async fn pair(&self) -> zbus::fdo::Result<()> {
         self.value().await?;
         if self.paired().await {
             return Ok(());
         }
-        if let Some(cert) = self
-            .context
-            .app
-            .connection_manager
-            .get_peer_certificate(&self.device)
-            .await
-        {
-            self.context
-                .app
-                .pairing_handler
-                .set_pending_peer_cert(&self.device, cert)
-                .await;
-        }
+        self.stage_peer_certificate().await;
         let pairing = &self.context.app.pairing_handler;
         if pairing.has_incoming_request(&self.device).await {
-            if !pairing.has_identity_anchor(&self.device).await {
-                return Err(failure("No peer certificate"));
-            }
-            self.context
-                .app
-                .connection_manager
-                .send_packet(&self.device, &Packet::pair_response(true))
-                .await
-                .map_err(failure)?;
-            pairing
-                .accept_pairing(&self.device)
-                .await
-                .map_err(failure)?;
-            let app = self.context.app.clone();
-            let device = self.device.clone();
-            tokio::spawn(async move {
-                app.send_plugin_init_packets(&device).await;
-            });
+            self.accept_incoming().await?;
         } else {
             let timestamp = pairing
                 .initiate_pairing(&self.device)
@@ -176,6 +183,49 @@ impl DeviceApi {
                 .map_err(failure)?;
         }
         Ok(())
+    }
+    /// Accept the phone's pending pairing request.
+    #[zbus(name = "acceptPairing")]
+    async fn accept_pairing(&self) -> zbus::fdo::Result<()> {
+        self.value().await?;
+        self.stage_peer_certificate().await;
+        if !self
+            .context
+            .app
+            .pairing_handler
+            .has_incoming_request(&self.device)
+            .await
+        {
+            return Err(failure("The phone is not asking to pair"));
+        }
+        self.accept_incoming().await
+    }
+    /// Decline the phone's pairing request, or withdraw ours.
+    #[zbus(name = "cancelPairing")]
+    async fn cancel_pairing(&self) -> zbus::fdo::Result<()> {
+        let app = &self.context.app;
+        if !matches!(
+            app.pairing_handler.pair_state(&self.device).await,
+            PairState::Requested | PairState::RequestedByPeer
+        ) {
+            return Ok(());
+        }
+        if app.connection_manager.is_connected(&self.device).await {
+            let _ = app
+                .connection_manager
+                .send_packet(&self.device, &Packet::pair_response(false))
+                .await;
+        }
+        let _ = app.pairing_handler.reject_pairing(&self.device).await;
+        self.context
+            .emit(
+                &self.device,
+                "org.kde.kdeconnect.device",
+                "pairStateChanged",
+                &(pair_state_number(PairState::NotPaired),),
+            )
+            .await
+            .map_err(failure)
     }
     #[zbus(name = "unpair")]
     async fn unpair(&self) -> zbus::fdo::Result<()> {
@@ -217,6 +267,62 @@ impl DeviceApi {
     pub async fn plugins_event(
         emitter: &zbus::object_server::SignalEmitter<'_>,
     ) -> zbus::Result<()>;
+    #[zbus(signal, name = "pairStateChanged")]
+    pub async fn pair_state_event(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        state: i32,
+    ) -> zbus::Result<()>;
+}
+
+impl DeviceApi {
+    /// The phone's certificate from its live link, so a request can be accepted
+    /// and its verification key computed.
+    async fn stage_peer_certificate(&self) {
+        if let Some(cert) = self
+            .context
+            .app
+            .connection_manager
+            .get_peer_certificate(&self.device)
+            .await
+        {
+            self.context
+                .app
+                .pairing_handler
+                .set_pending_peer_cert(&self.device, cert)
+                .await;
+        }
+    }
+    async fn accept_incoming(&self) -> zbus::fdo::Result<()> {
+        let pairing = &self.context.app.pairing_handler;
+        if !pairing.has_identity_anchor(&self.device).await {
+            return Err(failure("No peer certificate"));
+        }
+        self.context
+            .app
+            .connection_manager
+            .send_packet(&self.device, &Packet::pair_response(true))
+            .await
+            .map_err(failure)?;
+        pairing
+            .accept_pairing(&self.device)
+            .await
+            .map_err(failure)?;
+        let app = self.context.app.clone();
+        let device = self.device.clone();
+        tokio::spawn(async move {
+            app.send_plugin_init_packets(&device).await;
+        });
+        Ok(())
+    }
+}
+
+pub(crate) fn pair_state_number(state: PairState) -> i32 {
+    match state {
+        PairState::NotPaired => 0,
+        PairState::Requested => 1,
+        PairState::RequestedByPeer => 2,
+        PairState::Paired => 3,
+    }
 }
 
 pub struct Battery {

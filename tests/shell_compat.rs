@@ -1925,3 +1925,144 @@ async fn cached_attachments_keep_readable_names_and_old_copies_are_still_found()
         path
     );
 }
+
+async fn next_pair_state(states: &mut zbus::proxy::SignalStream<'_>) -> i32 {
+    let signal = tokio::time::timeout(Duration::from_secs(3), states.next())
+        .await
+        .unwrap()
+        .unwrap();
+    signal.body().deserialize::<(i32,)>().unwrap().0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phone_asking_to_pair_can_be_accepted_or_declined_over_dbus() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let bus = Bus::new();
+        let temp = tempfile::tempdir().unwrap();
+        let app = state(temp.path()).await;
+        let phone = loopback_phone(&app).await;
+        let _service = DBusService::on_connection(
+            app.clone(),
+            bus.connect(Some("org.kde.kdeconnect")).await,
+            temp.path().join("contacts"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let client = bus.connect(None).await;
+        // Uncached, so each read sees the daemon's current answer.
+        let device: zbus::Proxy = zbus::proxy::Builder::new(&client)
+            .destination("org.kde.kdeconnect")
+            .unwrap()
+            .path("/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap()
+            .interface("org.kde.kdeconnect.device")
+            .unwrap()
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .unwrap();
+        let mut states = device.receive_signal("pairStateChanged").await.unwrap();
+        let ask = || async {
+            let certificate = app
+                .connection_manager
+                .get_peer_certificate(&PHONE.into())
+                .await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            app.pairing_handler
+                .receive_pair_request_with_cert(&PHONE.into(), Some(now), certificate)
+                .await
+                .unwrap();
+            app.broadcaster
+                .broadcast(rust_connect::device::DeviceEvent::PairRequested {
+                    device_id: PHONE.into(),
+                    device_name: "Phone".into(),
+                });
+        };
+        app.pairing_handler.unpair(&PHONE.into()).await.unwrap();
+        while next_pair_state(&mut states).await != 0 {}
+
+        // A request from the phone is visible with the code both screens show.
+        ask().await;
+        assert_eq!(next_pair_state(&mut states).await, 2);
+        assert_eq!(device.get_property::<i32>("pairState").await.unwrap(), 2);
+        assert!(device
+            .get_property::<bool>("isPairRequestedByPeer")
+            .await
+            .unwrap());
+        let key = device
+            .get_property::<String>("verificationKey")
+            .await
+            .unwrap();
+        assert_eq!(key.len(), 8, "verification key {key:?}");
+        device.call::<_, _, ()>("acceptPairing", &()).await.unwrap();
+        let answer = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
+        assert_eq!(answer.packet_type, "kdeconnect.pair");
+        assert_eq!(answer.body["pair"], true);
+        assert!(device.get_property::<bool>("isPaired").await.unwrap());
+        assert_eq!(next_pair_state(&mut states).await, 3);
+
+        // Declining a later request tells the phone no and clears it.
+        app.pairing_handler.unpair(&PHONE.into()).await.unwrap();
+        while next_pair_state(&mut states).await != 0 {}
+        ask().await;
+        assert_eq!(next_pair_state(&mut states).await, 2);
+        device.call::<_, _, ()>("cancelPairing", &()).await.unwrap();
+        loop {
+            let packet = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
+            if packet.packet_type == "kdeconnect.pair" {
+                assert_eq!(packet.body["pair"], false);
+                break;
+            }
+        }
+        assert_eq!(next_pair_state(&mut states).await, 0);
+        assert!(!device
+            .get_property::<bool>("isPairRequestedByPeer")
+            .await
+            .unwrap());
+        assert!(device.call::<_, _, ()>("acceptPairing", &()).await.is_err());
+
+        // The Mainstream shell's bridge reports the request and answers it.
+        if let Some(script) = std::env::var_os("MAINSTREAM_PHONE_BRIDGE") {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            ask().await;
+            assert_eq!(next_pair_state(&mut states).await, 2);
+            let mut child = tokio::process::Command::new("python3")
+                .arg(script)
+                .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+                .env("HOME", temp.path())
+                .env("XDG_CACHE_HOME", temp.path().join("cache"))
+                .env("XDG_DATA_HOME", temp.path().join("data"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+            input.write_all(b"{\"cmd\":\"devices\"}\n").await.unwrap();
+            let event = bridge_event(&mut output, "pairRequests").await;
+            assert_eq!(event["requests"][0]["id"], PHONE);
+            assert_eq!(event["requests"][0]["key"].as_str().unwrap().len(), 8);
+            input
+                .write_all(b"{\"cmd\":\"acceptPairing\",\"device\":\"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n")
+                .await
+                .unwrap();
+            loop {
+                let packet = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
+                if packet.packet_type == "kdeconnect.pair" {
+                    assert_eq!(packet.body["pair"], true);
+                    break;
+                }
+            }
+            let event = bridge_event(&mut output, "pairRequests").await;
+            assert!(event["requests"].as_array().unwrap().is_empty());
+        }
+    })
+    .await
+    .unwrap();
+}

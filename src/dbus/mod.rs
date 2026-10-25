@@ -451,9 +451,19 @@ impl Context {
                 &(paired,),
             )
             .await?;
+            let pair_state =
+                devices::pair_state_number(self.app.pairing_handler.pair_state(&device).await);
+            self.emit(
+                &device,
+                "org.kde.kdeconnect.device",
+                "pairStateChanged",
+                &(pair_state,),
+            )
+            .await?;
             let properties = HashMap::from([
                 ("isReachable", OwnedValue::from(value.is_connected())),
                 ("isPaired", OwnedValue::from(paired)),
+                ("pairState", OwnedValue::from(pair_state)),
                 (
                     "name",
                     OwnedValue::from(zbus::zvariant::Str::from(value.name.as_str())),
