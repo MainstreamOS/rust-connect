@@ -1829,3 +1829,65 @@ async fn notification_icons_follow_exact_updates_and_late_cache_availability() {
     );
     service.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_burst_does_not_report_conversations_as_removed() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let client = bus.connect(None).await;
+    let proxy = zbus::Proxy::new(
+        &client,
+        "org.kde.kdeconnect",
+        "/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "org.kde.kdeconnect.device.conversations",
+    )
+    .await
+    .unwrap();
+    let mut removed = proxy.receive_signal("conversationRemoved").await.unwrap();
+    let mut loaded = proxy.receive_signal("conversationLoaded").await.unwrap();
+    let batch = |thread: i64| {
+        Packet::new(
+            "kdeconnect.sms.messages".into(),
+            serde_json::json!({"messages":[{"thread_id":thread,"_id":thread,"date":100 + thread,"body":"hello"}]}),
+        )
+    };
+    // Android sends a conversation list one conversation per packet.
+    for thread in 1..=3 {
+        app.plugins
+            .sms
+            .handle_packet(PHONE, batch(thread))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), loaded.next())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    // A reconnect clears the phone's threads, and the first packet back holds one.
+    app.plugins.sms.on_disconnected(PHONE).await;
+    app.plugins
+        .sms
+        .handle_packet(PHONE, batch(2))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), loaded.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), removed.next())
+            .await
+            .is_err(),
+        "threads that have not arrived again yet must not be reported removed"
+    );
+    service.stop().await;
+}

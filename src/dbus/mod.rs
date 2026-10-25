@@ -45,6 +45,8 @@ pub(crate) struct Context {
     contact_revisions: Mutex<HashMap<String, u64>>,
     watched_threads: Mutex<HashSet<(String, i64)>>,
     known_threads: Mutex<HashMap<String, HashSet<i64>>>,
+    /// When each device last sent messages, until `settle_threads` checks it.
+    thread_syncs: Mutex<HashMap<String, std::time::Instant>>,
     call_revisions: Mutex<HashMap<String, u64>>,
     attachment_revisions: Mutex<HashMap<(String, String), u64>>,
 }
@@ -281,7 +283,7 @@ impl Context {
                         tracing::warn!(%error, "Could not publish conversation message");
                     }
                 }
-                self.reconcile_threads(&device_id).await?;
+                self.remember_threads(&device_id).await;
                 for thread in completed {
                     let count = self.app.plugins.sms.get_thread(&device_id, thread).len() as u64;
                     self.emit(
@@ -514,6 +516,7 @@ impl Context {
             .await
             .retain(|(id, _)| id != device);
         self.known_threads.lock().await.remove(device);
+        self.thread_syncs.lock().await.remove(device);
         self.call_revisions.lock().await.remove(device);
         self.attachment_revisions
             .lock()
@@ -632,6 +635,7 @@ impl DBusService {
             contact_revisions: Mutex::new(HashMap::new()),
             watched_threads: Mutex::new(HashSet::new()),
             known_threads: Mutex::new(HashMap::new()),
+            thread_syncs: Mutex::new(HashMap::new()),
             call_revisions: Mutex::new(HashMap::new()),
             attachment_revisions: Mutex::new(HashMap::new()),
         });
@@ -711,6 +715,7 @@ impl DBusService {
                     },
                     _=refresh.tick()=> {
                         if let Err(error)=context.synchronize_contacts().await {tracing::warn!(%error,"Contact cache synchronization failed");}
+                        if let Err(error)=context.settle_threads().await {tracing::warn!(%error,"Conversation removal check failed");}
                         context.synchronize_devices().await
                     },
                 };

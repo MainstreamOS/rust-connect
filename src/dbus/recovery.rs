@@ -3,25 +3,80 @@
 use super::{compat, Context, ROOT};
 use std::{collections::HashSet, sync::Arc};
 
+/// How long a device's message batches must stop before missing threads
+/// count as removed. The reconnect burst takes a second or two.
+const THREAD_SYNC_QUIET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Threads the shell knows that a settled sync no longer has. None while the
+/// thread cap may have evicted some, since those can still exist on the phone.
+fn removed_threads(previous: &HashSet<i64>, current: &HashSet<i64>) -> Vec<i64> {
+    if current.len() >= crate::plugins::sms::MAX_SMS_THREADS_PER_DEVICE {
+        return Vec::new();
+    }
+    let mut removed: Vec<i64> = previous.difference(current).copied().collect();
+    removed.sort_unstable();
+    removed
+}
+
 impl Context {
-    pub(crate) async fn reconcile_threads(&self, device: &str) -> zbus::Result<HashSet<i64>> {
+    /// Add the device's current threads to those the shell has been told
+    /// about. A batch never removes one: after a reconnect the phone sends its
+    /// conversations one packet at a time with no end marker, so a thread
+    /// missing from a batch has usually just not arrived yet.
+    pub(crate) async fn remember_threads(&self, device: &str) -> HashSet<i64> {
         let current = self.app.plugins.sms.thread_ids(device);
-        let previous = self
-            .known_threads
+        self.known_threads
             .lock()
             .await
-            .insert(device.into(), current.clone())
-            .unwrap_or_default();
-        for removed in previous.difference(&current) {
-            self.emit(
-                device,
-                "org.kde.kdeconnect.device.conversations",
-                "conversationRemoved",
-                &(*removed,),
-            )
-            .await?;
+            .entry(device.into())
+            .or_default()
+            .extend(current.iter().copied());
+        self.thread_syncs
+            .lock()
+            .await
+            .insert(device.into(), std::time::Instant::now());
+        current
+    }
+    /// Report threads that are really gone, once a connected device has sent
+    /// nothing for `THREAD_SYNC_QUIET`.
+    pub(crate) async fn settle_threads(&self) -> zbus::Result<()> {
+        let settled: Vec<String> = {
+            let mut syncs = self.thread_syncs.lock().await;
+            let quiet: Vec<String> = syncs
+                .iter()
+                .filter(|(_, last)| last.elapsed() >= THREAD_SYNC_QUIET)
+                .map(|(device, _)| device.clone())
+                .collect();
+            for device in &quiet {
+                syncs.remove(device);
+            }
+            quiet
+        };
+        for device in settled {
+            if !self.app.connection_manager.is_connected(&device).await {
+                continue;
+            }
+            let current = self.app.plugins.sms.thread_ids(&device);
+            let removed = {
+                let mut known = self.known_threads.lock().await;
+                let previous = known.entry(device.clone()).or_default();
+                let removed = removed_threads(previous, &current);
+                for thread in &removed {
+                    previous.remove(thread);
+                }
+                removed
+            };
+            for thread in removed {
+                self.emit(
+                    &device,
+                    "org.kde.kdeconnect.device.conversations",
+                    "conversationRemoved",
+                    &(thread,),
+                )
+                .await?;
+            }
         }
-        Ok(current)
+        Ok(())
     }
     async fn synchronize_messages(&self, device: &str) -> zbus::Result<()> {
         let known = self
@@ -31,7 +86,7 @@ impl Context {
             .get(device)
             .cloned()
             .unwrap_or_default();
-        let current = self.reconcile_threads(device).await?;
+        let current = self.remember_threads(device).await;
         let watched = self.watched_threads.lock().await.clone();
         for thread in current {
             let messages = if watched.contains(&(device.into(), thread)) {
@@ -204,5 +259,25 @@ impl Context {
         self.resynchronize_notifications().await?;
         self.emit_at(ROOT, "org.kde.kdeconnect.daemon", "deviceListChanged", &())
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_settled_sync_reports_threads_the_phone_no_longer_has() {
+        let previous = HashSet::from([1, 2, 3]);
+        let current = HashSet::from([1, 3, 4]);
+        assert_eq!(removed_threads(&previous, &current), vec![2]);
+    }
+
+    #[test]
+    fn nothing_is_removed_while_the_thread_cap_may_have_evicted_some() {
+        let limit = crate::plugins::sms::MAX_SMS_THREADS_PER_DEVICE as i64;
+        let previous: HashSet<i64> = (0..limit + 10).collect();
+        let current: HashSet<i64> = (10..limit + 10).collect();
+        assert!(removed_threads(&previous, &current).is_empty());
     }
 }
