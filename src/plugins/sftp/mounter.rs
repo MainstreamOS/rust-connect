@@ -11,6 +11,12 @@
 //! The command builder and runner are injectable so tests can substitute
 //! fake binaries. See the harness in `tests/fake_binary_shim.rs`.
 //!
+//! Under the packaged systemd unit the daemon has a private mount
+//! namespace, and a mount made there never reaches the desktop that
+//! browses it. There sshfs runs as a transient unit of the user manager
+//! (`SystemCommandRunner::run_mount`): the mount lands in the session's
+//! namespace, propagates back into ours, and stopping the unit unmounts it.
+//!
 //! Safety properties enforced here:
 //! - The password is NEVER an argv element, env var, or file write.
 //! - The runner only knows about paths and binary names; the caller passes
@@ -69,7 +75,32 @@ pub trait CommandRunner: Send + Sync {
         args: &[OsString],
         stdin_payload: Option<&str>,
     ) -> Result<CommandOutput>;
+
+    /// Run sshfs so its mount reaches the desktop, as `unit` where the
+    /// runner keeps mounts in units. `mounted` reports when the mount point
+    /// is live. By default sshfs runs directly, as it always has.
+    fn run_mount(
+        &self,
+        unit: &str,
+        program: &Path,
+        args: &[OsString],
+        password: &str,
+        mounted: &dyn Fn() -> bool,
+    ) -> Result<CommandOutput> {
+        let _ = (unit, mounted);
+        self.run_with_stdin(program, args, Some(password))
+    }
+
+    /// Release a mount made by `run_mount` under the same `unit`.
+    fn run_unmount(&self, unit: &str, program: &Path, args: &[OsString]) -> Result<CommandOutput> {
+        let _ = unit;
+        self.run_with_stdin(program, args, None)
+    }
 }
+
+/// How long a session mount may take to appear before it counts as failed.
+/// Matches the plugin's own `MOUNT_TIMEOUT`.
+const SESSION_MOUNT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
@@ -81,13 +112,24 @@ pub struct CommandOutput {
 /// Production runner: uses `which` and `std::process::Command`.
 pub struct SystemCommandRunner {
     path: OsString,
+    /// Set when systemd started the daemon, so its mounts belong in units
+    /// of the user manager (see the module docs).
+    session_units: bool,
 }
 
 impl SystemCommandRunner {
     pub fn new() -> Self {
         Self {
             path: std::env::var_os("PATH").unwrap_or_default(),
+            session_units: std::env::var_os("INVOCATION_ID").is_some(),
         }
+    }
+
+    /// Stop a session mount's unit. `None` when systemctl is missing.
+    fn stop_unit(&self, unit: &str) -> Option<CommandOutput> {
+        let systemctl = self.which("systemctl")?;
+        let args = ["--user", "stop", unit].map(OsString::from);
+        self.run_with_stdin(&systemctl, &args, None).ok()
     }
 
     /// Build a Command whose argv and env are pre-validated. The caller
@@ -173,6 +215,150 @@ impl CommandRunner for SystemCommandRunner {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    fn run_mount(
+        &self,
+        unit: &str,
+        program: &Path,
+        args: &[OsString],
+        password: &str,
+        mounted: &dyn Fn() -> bool,
+    ) -> Result<CommandOutput> {
+        let Some(systemd_run) = self
+            .session_units
+            .then(|| self.which("systemd-run"))
+            .flatten()
+        else {
+            return self.run_with_stdin(program, args, Some(password));
+        };
+        // A unit left by an earlier run would still hold the name.
+        self.stop_unit(unit);
+
+        let mut argv: Vec<OsString> = ["--user", "--quiet", "--collect", "--pipe"]
+            .map(OsString::from)
+            .into();
+        argv.push(OsString::from(format!("--unit={unit}")));
+        argv.push(OsString::from("--"));
+        argv.push(program.as_os_str().to_owned());
+        argv.extend(args.iter().cloned());
+        // In the foreground the unit lasts exactly as long as the mount.
+        argv.push(OsString::from("-f"));
+
+        let mut child = self
+            .make_command(&systemd_run, &argv)
+            .spawn()
+            .map_err(|e| {
+                Error::Internal(format!("Failed to spawn {}: {}", systemd_run.display(), e))
+            })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin
+                .write_all(password.as_bytes())
+                .and_then(|_| stdin.write_all(b"\n"))
+                .map_err(|e| Error::Internal(format!("Failed to write stdin: {}", e)))?;
+        }
+
+        // The client stays attached until the unit stops, so it is reaped
+        // off-thread once the mount is up or abandoned.
+        let reap = |child: std::process::Child| {
+            std::thread::spawn(move || {
+                let _ = child.wait_with_output();
+            });
+        };
+        let deadline = std::time::Instant::now() + SESSION_MOUNT_WAIT;
+        loop {
+            if mounted() {
+                reap(child);
+                return Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            let exited = child
+                .try_wait()
+                .map_err(|e| Error::Internal(format!("Failed to poll child: {}", e)))?;
+            if exited.is_some() {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| Error::Internal(format!("Failed to wait on child: {}", e)))?;
+                // sshfs leaving without a mount is a failure even on status 0.
+                let status = match output.status.code() {
+                    Some(0) => 1,
+                    Some(code) => code,
+                    None => -1,
+                };
+                return Ok(CommandOutput {
+                    status,
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                self.stop_unit(unit);
+                reap(child);
+                return Ok(CommandOutput {
+                    status: -1,
+                    stdout: String::new(),
+                    stderr: "sshfs did not mount in time".to_string(),
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn run_unmount(&self, unit: &str, program: &Path, args: &[OsString]) -> Result<CommandOutput> {
+        // Stopping the unit ends sshfs, which unmounts in the session and so
+        // here too. A mount from before units (or a unit already gone) falls
+        // through to fusermount.
+        if self.session_units {
+            if let Some(output) = self.stop_unit(unit) {
+                if output.status == 0 {
+                    return Ok(output);
+                }
+            }
+        }
+        self.run_with_stdin(program, args, None)
+    }
+}
+
+/// The transient unit that holds a session mount, named after its mount
+/// point so a later run can find and stop it.
+fn session_unit_for(mount_point: &Path) -> String {
+    let name: String = mount_point
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("rust-connect-{name}")
+}
+
+/// Whether `path` is a mount point in this process's mount namespace.
+pub(crate) fn is_mount_point(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return false;
+        };
+        let target = path.to_string_lossy();
+        mountinfo.lines().any(|line| {
+            line.split_whitespace()
+                .nth(4)
+                .is_some_and(|mount_point| mount_point == target)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        path.exists()
     }
 }
 
@@ -280,7 +466,13 @@ impl Mounter {
         }
 
         let args = build_sshfs_args(req);
-        let output = self.runner.run_with_stdin(sshfs, &args, Some(password))?;
+        let output = self.runner.run_mount(
+            &session_unit_for(&req.mount_point),
+            sshfs,
+            &args,
+            password,
+            &|| is_mount_point(&req.mount_point),
+        )?;
         if output.status != 0 {
             // stderr first; sshfs occasionally reports on stdout only.
             // Both streams are password-free (the password travels on
@@ -333,7 +525,9 @@ impl Mounter {
             OsString::from("-u"),
             OsString::from(mount_point.as_os_str()),
         ];
-        let output = self.runner.run_with_stdin(program, &args, None)?;
+        let output = self
+            .runner
+            .run_unmount(&session_unit_for(mount_point), program, &args)?;
         if output.status == 0 {
             Ok(UnmountOutcome::Unmounted)
         } else {
@@ -684,5 +878,137 @@ mod tests {
             }
             MountOutcome::Mounted => panic!("non-zero exit must surface as Failed"),
         }
+    }
+
+    /// Fake `systemd-run`, `systemctl` and `fusermount3` for the session-unit
+    /// path. `systemd-run` records its argv and stdin, then either fails (a
+    /// `.fail` sidecar holds the message) or creates `mounted` and lingers
+    /// like the real client attached to a running unit.
+    fn session_fakes(dir: &Path) -> PathBuf {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let d = dir.to_string_lossy().into_owned();
+        let scripts = [
+            (
+                "systemd-run",
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{d}/run.argv'\ncat > '{d}/run.stdin'\n\
+                     if [ -f '{d}/run.fail' ]; then cat '{d}/run.fail' >&2; exit 1; fi\n\
+                     touch '{d}/mounted'\nsleep 1\n"
+                ),
+            ),
+            (
+                "systemctl",
+                format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{d}/systemctl.log'\n"),
+            ),
+            (
+                "fusermount3",
+                format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{d}/fusermount.log'\n"),
+            ),
+        ];
+        for (name, script) in scripts {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(bin.join(name))
+                .expect("create fake");
+            f.write_all(script.as_bytes()).expect("write fake");
+        }
+        // Let any fork that inherited a write handle exec first (ETXTBSY).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        bin
+    }
+
+    fn session_runner(bin: &Path) -> SystemCommandRunner {
+        SystemCommandRunner {
+            path: bin.as_os_str().to_owned(),
+            session_units: true,
+        }
+    }
+
+    #[test]
+    fn session_mount_runs_sshfs_in_a_user_unit_with_the_password_on_stdin() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bin = session_fakes(dir.path());
+        let runner = session_runner(&bin);
+        let req = MountRequest {
+            mount_point: dir.path().join("sftp-dev1"),
+            ..make_request()
+        };
+        let unit = session_unit_for(&req.mount_point);
+        assert_eq!(unit, "rust-connect-sftp-dev1");
+        let marker = dir.path().join("mounted");
+        let output = runner
+            .run_mount(
+                &unit,
+                Path::new("/usr/bin/sshfs"),
+                &build_sshfs_args(&req),
+                "secret",
+                &|| marker.exists(),
+            )
+            .expect("run_mount");
+        assert_eq!(output.status, 0);
+
+        let argv = std::fs::read_to_string(dir.path().join("run.argv")).expect("argv");
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            argv[..6],
+            [
+                "--user",
+                "--quiet",
+                "--collect",
+                "--pipe",
+                "--unit=rust-connect-sftp-dev1",
+                "--"
+            ]
+        );
+        assert_eq!(argv[6], "/usr/bin/sshfs");
+        assert_eq!(argv.last(), Some(&"-f"));
+        assert!(!argv.contains(&"secret"), "the password must stay off argv");
+        let stdin = std::fs::read_to_string(dir.path().join("run.stdin")).expect("stdin");
+        assert_eq!(stdin, "secret\n");
+        let stops = std::fs::read_to_string(dir.path().join("systemctl.log")).expect("stops");
+        assert!(stops.contains("--user stop rust-connect-sftp-dev1"));
+    }
+
+    #[test]
+    fn session_mount_reports_why_sshfs_left() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bin = session_fakes(dir.path());
+        std::fs::write(
+            dir.path().join("run.fail"),
+            "read: Connection reset by peer",
+        )
+        .expect("fail flag");
+        let runner = session_runner(&bin);
+        let marker = dir.path().join("mounted");
+        let output = runner
+            .run_mount(
+                "rust-connect-sftp-dev1",
+                Path::new("/usr/bin/sshfs"),
+                &build_sshfs_args(&make_request()),
+                "secret",
+                &|| marker.exists(),
+            )
+            .expect("run_mount");
+        assert_ne!(output.status, 0);
+        assert!(output.stderr.contains("Connection reset by peer"));
+    }
+
+    #[test]
+    fn session_unmount_stops_the_unit_instead_of_fusermount() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bin = session_fakes(dir.path());
+        let runner = session_runner(&bin);
+        let args = [OsString::from("-u"), OsString::from("/mnt/sftp-dev1")];
+        let output = runner
+            .run_unmount("rust-connect-sftp-dev1", &bin.join("fusermount3"), &args)
+            .expect("run_unmount");
+        assert_eq!(output.status, 0);
+        let stops = std::fs::read_to_string(dir.path().join("systemctl.log")).expect("stops");
+        assert!(stops.contains("--user stop rust-connect-sftp-dev1"));
+        assert!(!dir.path().join("fusermount.log").exists());
     }
 }

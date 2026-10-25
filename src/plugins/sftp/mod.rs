@@ -815,25 +815,6 @@ fn mount_point_for(data_dir: &std::path::Path, device_id: &str) -> PathBuf {
     data_dir.join("mounts").join(format!("sftp-{device_id}"))
 }
 
-fn mount_point_is_live(path: &std::path::Path) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
-            return false;
-        };
-        let target = path.to_string_lossy();
-        mountinfo.lines().any(|line| {
-            line.split_whitespace()
-                .nth(4)
-                .is_some_and(|mount_point| mount_point == target)
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        path.exists()
-    }
-}
-
 #[async_trait::async_trait]
 impl Plugin for SftpPlugin {
     fn name(&self) -> &str {
@@ -879,7 +860,7 @@ impl Plugin for SftpPlugin {
             connections.remove(device_id);
         }
         let mp = mount_point_for(&self.data_dir, device_id);
-        self.cleanup_mount_on_disconnect(device_id, mount_point_is_live(&mp))
+        self.cleanup_mount_on_disconnect(device_id, mounter::is_mount_point(&mp))
             .await;
     }
 
