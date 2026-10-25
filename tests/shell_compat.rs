@@ -869,6 +869,28 @@ async fn exercise_tls_roundtrip() {
     )
     .await
     .is_err());
+    // An inline reply typed into the desktop notification goes to the phone.
+    desktop_bus
+        .emit_signal(
+            None::<&str>,
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "NotificationReplied",
+            &(1u32, "typed inline"),
+        )
+        .await
+        .unwrap();
+    let inline = tokio::time::timeout(
+        Duration::from_secs(3),
+        peer.recv_packet(&"desktopbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        inline.body,
+        serde_json::json!({"requestReplyId":"separate-reply-handle","message":"typed inline"})
+    );
     desktop_bus
         .emit_signal(
             None::<&str>,

@@ -688,6 +688,8 @@ impl DBusService {
                                     match message.body().deserialize::<(u32,String)>() {Ok((id,action))=>context.desktop_action(id,&action).await,Err(e)=>Err(failure(e))}
                                 }else if name=="NotificationClosed" {
                                     match message.body().deserialize::<(u32,u32)>() {Ok((id,reason))=>context.desktop_closed(id,reason).await,Err(e)=>Err(failure(e))}
+                                }else if name=="NotificationReplied" {
+                                    match message.body().deserialize::<(u32,String)>() {Ok((id,text))=>context.desktop_replied(id,&text).await,Err(e)=>Err(failure(e))}
                                 }else{Ok(())};
                                 outcome.map_err(|e|zbus::Error::Failure(e.to_string()))
                             }

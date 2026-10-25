@@ -474,6 +474,23 @@ impl Context {
         }
         Ok(())
     }
+    /// A reply typed into the desktop's copy of a phone notification.
+    pub(crate) async fn desktop_replied(&self, id: u32, text: &str) -> zbus::fdo::Result<()> {
+        let record = self
+            .notifications
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find(|r| r.server_id == id)
+            .cloned();
+        match record {
+            Some(record) => {
+                self.notification_reply(&record.device, &record.id, text)
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
     pub(crate) async fn desktop_closed(&self, id: u32, reason: u32) -> zbus::fdo::Result<()> {
         // Expiry (1) and programmatic closure (3) must never delete a phone alert.
         if reason != 2 {
