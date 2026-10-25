@@ -282,7 +282,12 @@ impl TcpListenerService {
                     info!(
                         device_id = %device_id,
                         event = "incoming_reconnect_triggered",
-                        "Incoming connection disconnected for paired device, discovery will handle reconnect"
+                        "Incoming connection disconnected for paired device, asking it to dial back"
+                    );
+                    crate::services::connection_orchestrator::spawn_dial_back_requests(
+                        state.clone(),
+                        device_id.clone(),
+                        addr.ip(),
                     );
                 }
             }

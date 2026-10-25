@@ -285,6 +285,86 @@ async fn reconnect_loop(
     }
 }
 
+/// Ask a paired phone whose inbound link dropped to dial us again.
+///
+/// Android re-announces itself only every few minutes, so waiting for
+/// discovery left phones offline for that long. Whoever receives a UDP
+/// identity dials its sender (see `protocol::udp_unicast`), so this keeps
+/// sending ours to the phone's last address with the reconnect backoff
+/// until it is back, unpaired, or the daemon stops. It shares the reconnect
+/// loop's per-device slot, so only one of the two runs for a device.
+pub(crate) fn spawn_dial_back_requests(
+    state: Arc<AppState>,
+    device_id: String,
+    peer_ip: std::net::IpAddr,
+) {
+    tokio::spawn(request_dial_back_loop(
+        state,
+        device_id,
+        peer_ip,
+        crate::protocol::types::fallback_udp_port(),
+    ));
+}
+
+async fn request_dial_back_loop(
+    state: Arc<AppState>,
+    device_id: String,
+    peer_ip: std::net::IpAddr,
+    udp_port: u16,
+) {
+    let pending = state.connection_manager.reconnecting_devices.clone();
+    if !pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(device_id.clone())
+    {
+        return;
+    }
+    let _guard = PendingGuard {
+        pending,
+        id: device_id.clone(),
+    };
+    let mut attempt = 0u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let delay = backoff_delay(
+            attempt.min(6),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(30),
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = state.shutdown.cancelled() => return,
+        }
+        if state.shutdown.is_cancelled()
+            || state.connection_manager.is_connected(&device_id).await
+            || !state.pairing_handler.is_paired(&device_id).await
+        {
+            return;
+        }
+        let Some(our_identity) = state.connection_manager.get_identity() else {
+            return;
+        };
+        match crate::protocol::udp_unicast::unicast_identity(&our_identity, peer_ip, udp_port).await
+        {
+            Ok(target) => debug!(
+                device_id = %device_id,
+                target = %target,
+                attempt = attempt,
+                event = "dial_back_requested",
+                "Asked a dropped phone to dial back"
+            ),
+            Err(e) => debug!(
+                device_id = %device_id,
+                attempt = attempt,
+                error = %e,
+                event = "dial_back_request_failed",
+                "Could not ask a dropped phone to dial back"
+            ),
+        }
+    }
+}
+
 /// Spawns a connection task for a discovered device.
 /// Includes a 2-second delay to avoid connecting to devices that are already connecting.
 pub fn spawn_discovered_connection(state: Arc<AppState>, identity: Identity, addr: SocketAddr) {
@@ -684,6 +764,81 @@ mod tests {
         .expect("another discovery event must not create a competing retry loop");
         state.shutdown.cancel();
         first.await.unwrap();
+        assert!(state
+            .connection_manager
+            .reconnecting_devices
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    async fn pair_peer(state: &Arc<AppState>) {
+        state
+            .registry
+            .add(crate::device::Device::new(
+                PEER_ID.to_string(),
+                "Peer".to_string(),
+                crate::device::types::DeviceType::Phone,
+                8,
+            ))
+            .await
+            .unwrap();
+        state
+            .pairing_handler
+            .set_pending_peer_cert(&PEER_ID.to_string(), make_external_cert_der(PEER_ID))
+            .await;
+        state
+            .pairing_handler
+            .force_accept_pairing(&PEER_ID.to_string())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dropped_inbound_phone_is_asked_to_dial_back() {
+        let (state, _t) = test_state();
+        pair_peer(&state).await;
+        let phone = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = phone.local_addr().unwrap().port();
+        let task = tokio::spawn(request_dial_back_loop(
+            state.clone(),
+            PEER_ID.to_string(),
+            "127.0.0.1".parse().unwrap(),
+            port,
+        ));
+        let mut buf = vec![0u8; 65536];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), phone.recv_from(&mut buf))
+                .await
+                .expect("a dropped paired phone must be asked to dial back")
+                .unwrap();
+        let datagram = String::from_utf8_lossy(&buf[..len]);
+        assert!(datagram.contains("kdeconnect.identity"));
+        assert!(datagram.contains(OUR_ID));
+        state.shutdown.cancel();
+        task.await.unwrap();
+        assert!(state
+            .connection_manager
+            .reconnecting_devices
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dial_back_requests_stop_for_an_unpaired_phone() {
+        let (state, _t) = test_state();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            request_dial_back_loop(
+                state.clone(),
+                PEER_ID.to_string(),
+                "127.0.0.1".parse().unwrap(),
+                9,
+            ),
+        )
+        .await
+        .expect("an unpaired phone must not keep being asked to dial back");
         assert!(state
             .connection_manager
             .reconnecting_devices
