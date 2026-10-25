@@ -1910,8 +1910,15 @@ async fn cached_attachments_keep_readable_names_and_old_copies_are_still_found()
     .unwrap();
     let path = sms.attachment_path(PHONE, "PART_1700000000000").unwrap();
     assert_eq!(path.file_name().unwrap(), "PART_1700000000000.jpg");
-    let directory = path.parent().unwrap();
-    std::fs::create_dir_all(directory).unwrap();
+    // Identifiers that read the same still get their own copies.
+    let lookalike = sms
+        .attachment_path(PHONE, "PART_1700000000000.jpg")
+        .unwrap();
+    assert_eq!(lookalike.file_name(), path.file_name());
+    assert_ne!(lookalike, path);
+    let slot = path.parent().unwrap();
+    let directory = slot.parent().unwrap();
+    std::fs::create_dir_all(slot).unwrap();
     // Copies cached under the old digest names are still served.
     let legacy = directory.join(rust_connect::plugins::sms::attachment_filename("PART_old"));
     std::fs::write(&legacy, b"old").unwrap();

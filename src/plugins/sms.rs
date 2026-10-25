@@ -95,6 +95,11 @@ struct PartialAttachment(PathBuf);
 impl Drop for PartialAttachment {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        // A failed first download leaves its folder empty; one holding an
+        // older copy is not empty and stays.
+        if let Some(slot) = self.0.parent() {
+            let _ = std::fs::remove_dir(slot);
+        }
     }
 }
 
@@ -119,11 +124,11 @@ pub fn attachment_filename(identifier: &str) -> String {
     hex::encode(Sha256::digest(identifier.as_bytes()))
 }
 
-/// The cache name for an attachment: the phone's identifier made safe for a
-/// file name, with an extension from its type when the identifier has none,
-/// so saved and opened copies keep a name and type (`PART_….jpg`, as KDE
-/// Connect names them). An identifier that had to be changed gets part of
-/// its digest added so two identifiers never share a name.
+/// The readable name an attachment is cached under: the phone's identifier
+/// made safe for a file name, with an extension from its type when the
+/// identifier has none, so saved and opened copies keep a name and type
+/// (`PART_….jpg`, as KDE Connect names them). Each attachment has its own
+/// folder (`attachment_slot`), so two identifiers never share a file.
 pub fn attachment_name(identifier: &str, mime: Option<&str>) -> String {
     let (stem, extension) = match identifier.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() && is_extension(ext) => {
@@ -131,7 +136,7 @@ pub fn attachment_name(identifier: &str, mime: Option<&str>) -> String {
         }
         _ => (identifier, None),
     };
-    let safe: String = stem
+    let mut name: String = stem
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -142,48 +147,39 @@ pub fn attachment_name(identifier: &str, mime: Option<&str>) -> String {
         })
         .take(120)
         .collect();
-    let stem = if safe.is_empty() {
-        attachment_filename(identifier)
-    } else if safe != stem {
-        format!("{safe}-{}", &attachment_filename(identifier)[..12])
-    } else {
-        safe
-    };
+    if name.is_empty() {
+        name = "attachment".into();
+    }
     match extension.or_else(|| {
         mime.and_then(crate::utils::compat::media_extension)
             .map(str::to_string)
     }) {
-        Some(extension) => format!("{stem}.{extension}"),
-        None => stem,
+        Some(extension) => format!("{name}.{extension}"),
+        None => name,
     }
+}
+
+/// The folder holding one attachment, named by its identifier's digest.
+fn attachment_slot(identifier: &str) -> String {
+    attachment_filename(identifier)[..32].to_string()
 }
 
 fn is_extension(value: &str) -> bool {
     (1..=5).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// A copy of the attachment already cached under another name: without the
-/// extension its type gives, with one, or under the digest attachments were
-/// named by before.
-fn cached_attachment(directory: &std::path::Path, identifier: &str) -> Option<PathBuf> {
-    let legacy = directory.join(attachment_filename(identifier));
-    if legacy.is_file() {
-        return Some(legacy);
-    }
-    let bare = attachment_name(identifier, None);
-    std::fs::read_dir(directory)
+/// Downloads in progress carry a 32-character uuid as their extension.
+fn is_partial_download(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext.len() == 32)
+}
+
+/// The finished file in an attachment's folder, whatever name it was given.
+fn cached_file(slot: &std::path::Path) -> Option<PathBuf> {
+    std::fs::read_dir(slot)
         .ok()?
         .filter_map(|entry| entry.ok())
-        .find(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name == bare
-                || name
-                    .strip_prefix(&bare)
-                    .and_then(|rest| rest.strip_prefix('.'))
-                    .is_some_and(is_extension)
-        })
         .map(|entry| entry.path())
+        .find(|path| path.is_file() && !is_partial_download(path))
 }
 
 impl Default for SmsPlugin {
@@ -217,15 +213,32 @@ impl SmsPlugin {
         self
     }
 
+    /// Where an attachment is cached: its existing copy, one cached under the
+    /// digest attachments were named by before, or where a new copy goes.
     pub fn attachment_path(&self, device: &str, identifier: &str) -> Option<PathBuf> {
         let runtime = self.runtime.as_ref()?;
         let directory = runtime.cache.join(attachment_filename(device));
-        let mime = self.attachment_mime(device, identifier);
-        let path = directory.join(attachment_name(identifier, mime.as_deref()));
-        if path.is_file() {
+        if let Some(path) = cached_file(&directory.join(attachment_slot(identifier))) {
             return Some(path);
         }
-        Some(cached_attachment(&directory, identifier).unwrap_or(path))
+        let legacy = directory.join(attachment_filename(identifier));
+        if legacy.is_file() {
+            return Some(legacy);
+        }
+        self.attachment_target(device, identifier)
+    }
+
+    /// Where a newly received copy of an attachment is written.
+    fn attachment_target(&self, device: &str, identifier: &str) -> Option<PathBuf> {
+        let runtime = self.runtime.as_ref()?;
+        let mime = self.attachment_mime(device, identifier);
+        Some(
+            runtime
+                .cache
+                .join(attachment_filename(device))
+                .join(attachment_slot(identifier))
+                .join(attachment_name(identifier, mime.as_deref())),
+        )
     }
 
     /// The type the phone gave an attachment, from the messages it was sent with.
@@ -283,12 +296,13 @@ impl SmsPlugin {
             })?;
         // Always bind payload retrieval to the authenticated phone's address.
         info.ip = Some(peer.ip().to_string());
-        let target = self.attachment_path(device, identifier).ok_or_else(|| {
+        let target = self.attachment_target(device, identifier).ok_or_else(|| {
             crate::utils::errors::Error::InvalidRequest("SMS cache unavailable".into())
         })?;
-        if let Some(parent) = target.parent() {
-            crate::utils::compat::private_directory(parent).await?;
-        }
+        let slot = target.parent().unwrap_or(&target).to_path_buf();
+        let directory = slot.parent().unwrap_or(&slot).to_path_buf();
+        crate::utils::compat::private_directory(&directory).await?;
+        crate::utils::compat::private_directory(&slot).await?;
         let temporary = target.with_extension(uuid::Uuid::new_v4().simple().to_string());
         let _partial = PartialAttachment(temporary.clone());
         let transfer = crate::protocol::payload_transfer::PayloadTransfer::new(
@@ -302,9 +316,17 @@ impl SmsPlugin {
         }
         crate::utils::compat::private_file(&temporary).await?;
         tokio::fs::rename(&temporary, &target).await?;
-        if let Some(parent) = target.parent() {
-            Self::trim_attachment_cache(parent, &target).await?;
+        // The new copy replaces any older one, under another name or the old digest.
+        if let Ok(mut entries) = tokio::fs::read_dir(&slot).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path != target && !is_partial_download(&path) {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+            }
         }
+        let _ = tokio::fs::remove_file(directory.join(attachment_filename(identifier))).await;
+        Self::trim_attachment_cache(&directory, &slot).await?;
         Ok(target)
     }
 
@@ -313,36 +335,61 @@ impl SmsPlugin {
         keep: &std::path::Path,
     ) -> Result<()> {
         // Bounded per-phone disk use; original files can be fetched again.
+        // Each attachment folder, or file cached before folders, counts once.
         let mut entries = tokio::fs::read_dir(directory).await?;
-        let mut files = Vec::new();
+        let mut cached = Vec::new();
         let mut bytes = 0u64;
         while let Some(entry) = entries.next_entry().await? {
-            // Downloads in progress carry a 32-character uuid as their extension.
-            let name = entry.file_name();
-            if name
-                .to_string_lossy()
-                .rsplit_once('.')
-                .is_some_and(|(_, ext)| ext.len() == 32)
-            {
-                continue;
-            }
+            let path = entry.path();
             let metadata = entry.metadata().await?;
-            if metadata.is_file() {
-                bytes += metadata.len();
-                files.push((
-                    metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    entry.path(),
+            let (size, modified) = if metadata.is_dir() {
+                let mut size = 0u64;
+                let mut modified = None;
+                let mut downloading = false;
+                let mut files = tokio::fs::read_dir(&path).await?;
+                while let Some(file) = files.next_entry().await? {
+                    let file_metadata = file.metadata().await?;
+                    if is_partial_download(&file.path()) {
+                        downloading = true;
+                    } else if file_metadata.is_file() {
+                        size += file_metadata.len();
+                        modified = modified.max(Some(
+                            file_metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                        ));
+                    }
+                }
+                // A folder still downloading, or just made for a download that
+                // has not created its file yet, is never evicted.
+                match modified {
+                    Some(modified) if !downloading => (size, modified),
+                    _ => continue,
+                }
+            } else if metadata.is_file() && !is_partial_download(&path) {
+                (
                     metadata.len(),
-                ));
-            }
+                    metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                )
+            } else {
+                continue;
+            };
+            bytes += size;
+            cached.push((modified, path, size, metadata.is_dir()));
         }
-        files.sort_by_key(|f| f.0);
-        let mut count = files.len();
-        for (_, path, size) in files {
+        cached.sort_by_key(|c| c.0);
+        let mut count = cached.len();
+        for (_, path, size, is_dir) in cached {
             if bytes <= 512 * 1024 * 1024 && count <= 1024 {
                 break;
             }
-            if path != keep && tokio::fs::remove_file(path).await.is_ok() {
+            if path == keep {
+                continue;
+            }
+            let removed = if is_dir {
+                tokio::fs::remove_dir_all(&path).await
+            } else {
+                tokio::fs::remove_file(&path).await
+            };
+            if removed.is_ok() {
                 bytes -= size;
                 count -= 1;
             }
@@ -552,6 +599,61 @@ mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
 
+    #[tokio::test]
+    async fn the_cache_trim_never_takes_a_folder_that_is_still_downloading() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let downloading = directory.join("downloading");
+        std::fs::create_dir(&downloading).unwrap();
+        std::fs::write(
+            downloading.join(format!("part.{}", uuid::Uuid::new_v4().simple())),
+            b"partial",
+        )
+        .unwrap();
+        let fresh = directory.join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        for index in 0..1030 {
+            let slot = directory.join(format!("slot{index:04}"));
+            std::fs::create_dir(&slot).unwrap();
+            std::fs::write(slot.join("PART.jpg"), b"x").unwrap();
+        }
+        let keep = directory.join("slot0000");
+        SmsPlugin::trim_attachment_cache(directory, &keep)
+            .await
+            .unwrap();
+        assert!(downloading.exists() && fresh.exists() && keep.exists());
+        let finished = std::fs::read_dir(directory)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("slot")
+            })
+            .count();
+        assert_eq!(finished, 1024);
+    }
+
+    #[test]
+    fn an_abandoned_first_download_removes_its_empty_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let refresh = temp.path().join("refresh");
+        for slot in [&first, &refresh] {
+            std::fs::create_dir(slot).unwrap();
+        }
+        std::fs::write(refresh.join("PART.jpg"), b"old copy").unwrap();
+        for slot in [&first, &refresh] {
+            let partial = slot.join(format!("PART.{}", uuid::Uuid::new_v4().simple()));
+            std::fs::write(&partial, b"partial").unwrap();
+            drop(PartialAttachment(partial));
+        }
+        assert!(!first.exists());
+        assert!(refresh.join("PART.jpg").exists());
+    }
+
     #[test]
     fn attachment_names_keep_the_identifier_and_gain_an_extension_from_the_type() {
         assert_eq!(
@@ -574,15 +676,20 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_attachment_identifiers_cannot_escape_or_collide() {
+    fn unsafe_attachment_identifiers_cannot_escape_and_keep_their_own_folder() {
         for identifier in ["../../etc/passwd", ".hidden", ".", "a/b.jpg"] {
             let name = attachment_name(identifier, None);
             assert!(!name.contains('/'), "{identifier} -> {name}");
             assert!(!name.starts_with('.'), "{identifier} -> {name}");
             assert!(!name.is_empty());
         }
-        assert_ne!(attachment_name("a b", None), attachment_name("a_b", None));
         assert!(attachment_name(&"x".repeat(400), None).len() < 160);
+        // Names may coincide; the folders, named by digest, never do.
+        assert_eq!(
+            attachment_name("PART_17", Some("image/jpeg")),
+            attachment_name("PART_17.jpg", None)
+        );
+        assert_ne!(attachment_slot("PART_17"), attachment_slot("PART_17.jpg"));
     }
 
     #[tokio::test]
