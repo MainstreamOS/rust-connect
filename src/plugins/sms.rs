@@ -119,6 +119,73 @@ pub fn attachment_filename(identifier: &str) -> String {
     hex::encode(Sha256::digest(identifier.as_bytes()))
 }
 
+/// The cache name for an attachment: the phone's identifier made safe for a
+/// file name, with an extension from its type when the identifier has none,
+/// so saved and opened copies keep a name and type (`PART_….jpg`, as KDE
+/// Connect names them). An identifier that had to be changed gets part of
+/// its digest added so two identifiers never share a name.
+pub fn attachment_name(identifier: &str, mime: Option<&str>) -> String {
+    let (stem, extension) = match identifier.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && is_extension(ext) => {
+            (stem, Some(ext.to_ascii_lowercase()))
+        }
+        _ => (identifier, None),
+    };
+    let safe: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect();
+    let stem = if safe.is_empty() {
+        attachment_filename(identifier)
+    } else if safe != stem {
+        format!("{safe}-{}", &attachment_filename(identifier)[..12])
+    } else {
+        safe
+    };
+    match extension.or_else(|| {
+        mime.and_then(crate::utils::compat::media_extension)
+            .map(str::to_string)
+    }) {
+        Some(extension) => format!("{stem}.{extension}"),
+        None => stem,
+    }
+}
+
+fn is_extension(value: &str) -> bool {
+    (1..=5).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// A copy of the attachment already cached under another name: without the
+/// extension its type gives, with one, or under the digest attachments were
+/// named by before.
+fn cached_attachment(directory: &std::path::Path, identifier: &str) -> Option<PathBuf> {
+    let legacy = directory.join(attachment_filename(identifier));
+    if legacy.is_file() {
+        return Some(legacy);
+    }
+    let bare = attachment_name(identifier, None);
+    std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == bare
+                || name
+                    .strip_prefix(&bare)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .is_some_and(is_extension)
+        })
+        .map(|entry| entry.path())
+}
+
 impl Default for SmsPlugin {
     fn default() -> Self {
         Self::new()
@@ -152,12 +219,35 @@ impl SmsPlugin {
 
     pub fn attachment_path(&self, device: &str, identifier: &str) -> Option<PathBuf> {
         let runtime = self.runtime.as_ref()?;
-        Some(
-            runtime
-                .cache
-                .join(attachment_filename(device))
-                .join(attachment_filename(identifier)),
-        )
+        let directory = runtime.cache.join(attachment_filename(device));
+        let mime = self.attachment_mime(device, identifier);
+        let path = directory.join(attachment_name(identifier, mime.as_deref()));
+        if path.is_file() {
+            return Some(path);
+        }
+        Some(cached_attachment(&directory, identifier).unwrap_or(path))
+    }
+
+    /// The type the phone gave an attachment, from the messages it was sent with.
+    fn attachment_mime(&self, device: &str, identifier: &str) -> Option<String> {
+        let field = |attachment: &serde_json::Value, snake: &str, camel: &str| {
+            attachment
+                .get(snake)
+                .or_else(|| attachment.get(camel))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let threads = self.threads.read().unwrap_or_else(|e| e.into_inner());
+        threads
+            .iter()
+            .filter(|((owner, _), _)| owner == device)
+            .flat_map(|(_, messages)| messages.iter())
+            .flat_map(|message| message.attachments.iter().flatten())
+            .find(|attachment| {
+                field(attachment, "unique_identifier", "uniqueIdentifier").as_deref()
+                    == Some(identifier)
+            })
+            .and_then(|attachment| field(attachment, "mime_type", "mimeType"))
     }
 
     async fn receive_attachment(&self, device: &str, packet: Packet) -> Result<PathBuf> {
@@ -227,7 +317,13 @@ impl SmsPlugin {
         let mut files = Vec::new();
         let mut bytes = 0u64;
         while let Some(entry) = entries.next_entry().await? {
-            if entry.file_name().to_string_lossy().len() != 64 {
+            // Downloads in progress carry a 32-character uuid as their extension.
+            let name = entry.file_name();
+            if name
+                .to_string_lossy()
+                .rsplit_once('.')
+                .is_some_and(|(_, ext)| ext.len() == 32)
+            {
                 continue;
             }
             let metadata = entry.metadata().await?;
@@ -455,6 +551,39 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn attachment_names_keep_the_identifier_and_gain_an_extension_from_the_type() {
+        assert_eq!(
+            attachment_name("PART_1700000000000", Some("image/jpeg")),
+            "PART_1700000000000.jpg"
+        );
+        assert_eq!(
+            attachment_name("PART_1700000000000", Some("audio/amr")),
+            "PART_1700000000000.amr"
+        );
+        assert_eq!(
+            attachment_name("voice-note.AMR", Some("audio/mp4")),
+            "voice-note.amr"
+        );
+        assert_eq!(
+            attachment_name("PART_17", Some("application/x-unknown")),
+            "PART_17"
+        );
+        assert_eq!(attachment_name("PART_17", None), "PART_17");
+    }
+
+    #[test]
+    fn unsafe_attachment_identifiers_cannot_escape_or_collide() {
+        for identifier in ["../../etc/passwd", ".hidden", ".", "a/b.jpg"] {
+            let name = attachment_name(identifier, None);
+            assert!(!name.contains('/'), "{identifier} -> {name}");
+            assert!(!name.starts_with('.'), "{identifier} -> {name}");
+            assert!(!name.is_empty());
+        }
+        assert_ne!(attachment_name("a b", None), attachment_name("a_b", None));
+        assert!(attachment_name(&"x".repeat(400), None).len() < 160);
+    }
 
     #[tokio::test]
     async fn test_sms_plugin() {

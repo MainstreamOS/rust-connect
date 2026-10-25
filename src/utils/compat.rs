@@ -24,6 +24,59 @@ pub fn file_uri(path: &Path) -> String {
     uri
 }
 
+/// File extensions and the media types they stand for. The first extension
+/// listed for a type is the one a file of that type is given.
+const MEDIA_TYPES: &[(&str, &str)] = &[
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("jpg", "image/jpg"),
+    ("png", "image/png"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("heic", "image/heic"),
+    ("avif", "image/avif"),
+    ("mp4", "video/mp4"),
+    ("m4v", "video/mp4"),
+    ("3gp", "video/3gpp"),
+    ("mov", "video/quicktime"),
+    ("mkv", "video/x-matroska"),
+    ("webm", "video/webm"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/mp4"),
+    ("aac", "audio/aac"),
+    ("3gp", "audio/3gpp"),
+    ("mp3", "audio/mpeg"),
+    ("wav", "audio/wav"),
+    ("amr", "audio/amr"),
+    ("ogg", "audio/ogg"),
+    ("opus", "audio/ogg"),
+    ("pdf", "application/pdf"),
+    ("txt", "text/plain"),
+    ("vcf", "text/x-vcard"),
+    ("vcf", "text/vcard"),
+];
+/// The media type a file extension stands for.
+pub fn media_type(extension: &str) -> Option<&'static str> {
+    let extension = extension.to_ascii_lowercase();
+    MEDIA_TYPES
+        .iter()
+        .find(|(ext, _)| *ext == extension)
+        .map(|(_, mime)| *mime)
+}
+/// The extension a file of `mime` is given, ignoring parameters such as a charset.
+pub fn media_extension(mime: &str) -> Option<&'static str> {
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    MEDIA_TYPES
+        .iter()
+        .find(|(_, kind)| *kind == mime)
+        .map(|(ext, _)| *ext)
+}
+
 /// Preserve normal KDE IDs; escape the reserved prefix as well to avoid collisions.
 pub fn component(value: &str) -> String {
     if !value.is_empty()

@@ -157,33 +157,10 @@ async fn encode_attachments(paths: Vec<OwnedValue>) -> zbus::fdo::Result<Vec<ser
     Ok(attachments)
 }
 fn mime_type(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
+    path.extension()
         .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "heic" => "image/heic",
-        "avif" => "image/avif",
-        "mp4" | "m4v" => "video/mp4",
-        "3gp" => "video/3gpp",
-        "mov" => "video/quicktime",
-        "mkv" => "video/x-matroska",
-        "webm" => "video/webm",
-        "m4a" | "aac" => "audio/mp4",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "amr" => "audio/amr",
-        "ogg" | "opus" => "audio/ogg",
-        "pdf" => "application/pdf",
-        "txt" => "text/plain",
-        _ => "application/octet-stream",
-    }
+        .and_then(crate::utils::compat::media_type)
+        .unwrap_or("application/octet-stream")
 }
 
 pub(crate) struct Conversations {

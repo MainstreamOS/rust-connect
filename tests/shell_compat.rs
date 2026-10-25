@@ -1891,3 +1891,37 @@ async fn a_reconnect_burst_does_not_report_conversations_as_removed() {
     );
     service.stop().await;
 }
+
+#[tokio::test]
+async fn cached_attachments_keep_readable_names_and_old_copies_are_still_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let sms = &app.plugins.sms;
+    sms.handle_packet(
+        PHONE,
+        Packet::new(
+            "kdeconnect.sms.messages".into(),
+            serde_json::json!({"messages":[{"thread_id":7,"_id":1,"date":1,"body":"","attachments":[
+                {"part_id":5,"mime_type":"image/jpeg","unique_identifier":"PART_1700000000000","encoded_thumbnail":""}
+            ]}]}),
+        ),
+    )
+    .await
+    .unwrap();
+    let path = sms.attachment_path(PHONE, "PART_1700000000000").unwrap();
+    assert_eq!(path.file_name().unwrap(), "PART_1700000000000.jpg");
+    let directory = path.parent().unwrap();
+    std::fs::create_dir_all(directory).unwrap();
+    // Copies cached under the old digest names are still served.
+    let legacy = directory.join(rust_connect::plugins::sms::attachment_filename("PART_old"));
+    std::fs::write(&legacy, b"old").unwrap();
+    assert_eq!(sms.attachment_path(PHONE, "PART_old").unwrap(), legacy);
+    // A copy cached with its extension is still found once a reconnect has
+    // cleared the message that gave its type.
+    std::fs::write(&path, b"new").unwrap();
+    sms.on_disconnected(PHONE).await;
+    assert_eq!(
+        sms.attachment_path(PHONE, "PART_1700000000000").unwrap(),
+        path
+    );
+}
