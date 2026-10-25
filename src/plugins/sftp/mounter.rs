@@ -349,17 +349,46 @@ pub(crate) fn is_mount_point(path: &Path) -> bool {
         let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
             return false;
         };
-        let target = path.to_string_lossy();
+        use std::os::unix::ffi::OsStrExt;
+        let target = path.as_os_str().as_bytes();
         mountinfo.lines().any(|line| {
             line.split_whitespace()
                 .nth(4)
-                .is_some_and(|mount_point| mount_point == target)
+                .is_some_and(|mount_point| unescape_mount_path(mount_point) == target)
         })
     }
     #[cfg(not(target_os = "linux"))]
     {
         path.exists()
     }
+}
+
+/// A mountinfo path with the kernel's octal escapes (`\040` for a space,
+/// `\011`, `\012`, `\134`) turned back into bytes.
+fn unescape_mount_path(field: &str) -> Vec<u8> {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| bytes[i] == b'\\' && d.iter().all(|b| (b'0'..=b'7').contains(b)));
+        match octal {
+            Some(digits) => {
+                out.push(
+                    digits
+                        .iter()
+                        .fold(0u8, |n, d| n.wrapping_mul(8).wrapping_add(d - b'0')),
+                );
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Build the argv vector sshfs expects. The password is NOT in here —
@@ -678,6 +707,13 @@ mod tests {
             path: "/storage/emulated/0".to_string(),
             mount_point: PathBuf::from("/tmp/sftp-test-mount"),
         }
+    }
+
+    #[test]
+    fn mount_paths_with_spaces_match_the_kernels_escaped_form() {
+        assert_eq!(unescape_mount_path(r"/home/a\040b/mnt"), b"/home/a b/mnt");
+        assert_eq!(unescape_mount_path(r"/x\134y\011z"), b"/x\\y\tz");
+        assert_eq!(unescape_mount_path(r"/plain\path"), b"/plain\\path");
     }
 
     #[test]
