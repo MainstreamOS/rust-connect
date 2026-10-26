@@ -298,6 +298,10 @@ impl AppState {
             return;
         }
 
+        // Built once: each plugin's connect setup runs a single time (some
+        // ask the phone for its whole history), and a pass resends only what
+        // the link failed to deliver.
+        let mut remaining = self.plugin_registry.notify_connected(device_id).await;
         for attempt in 1..=ATTEMPTS {
             // Wait for a live link before spending the pass. A replacement in
             // flight resolves within a poll or two; a genuinely absent link
@@ -309,43 +313,37 @@ impl AppState {
                 tokio::time::sleep(POLL).await;
             }
 
-            // Re-generate per pass: a fresh link deserves a fresh
-            // advertisement set, which is exactly what the connect-time path
-            // sends on every connection.
-            let packets = self.plugin_registry.notify_connected(device_id).await;
-            let mut failed = 0usize;
-            for pkt in &packets {
-                if let Err(e) = self.connection_manager.send_packet(device_id, pkt).await {
-                    // Unsupported features cannot recover on another pass.
-                    // Retrying them also repeats every successful plugin's
-                    // initialization, including full phone history requests.
-                    if matches!(
-                        e,
-                        crate::utils::errors::Error::CapabilityNotSupported { .. }
-                    ) {
-                        continue;
+            let total = remaining.len();
+            let mut undelivered = Vec::new();
+            for pkt in remaining {
+                match self.connection_manager.send_packet(device_id, &pkt).await {
+                    Ok(()) => {}
+                    // A packet the phone does not take cannot succeed later.
+                    Err(crate::utils::errors::Error::CapabilityNotSupported { .. }) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            device_id = %device_id,
+                            packet_type = %pkt.packet_type,
+                            error = %e,
+                            attempt,
+                            event = "init_packet_send_retrying",
+                            "Init packet send failed; will retry if attempts remain"
+                        );
+                        undelivered.push(pkt);
                     }
-                    failed += 1;
-                    tracing::debug!(
-                        device_id = %device_id,
-                        packet_type = %pkt.packet_type,
-                        error = %e,
-                        attempt,
-                        event = "init_packet_send_retrying",
-                        "Init packet send failed; will retry if attempts remain"
-                    );
                 }
             }
+            remaining = undelivered;
 
-            if failed == 0 {
+            if remaining.is_empty() {
                 return;
             }
 
             tracing::debug!(
                 device_id = %device_id,
                 attempt,
-                failed,
-                total = packets.len(),
+                failed = remaining.len(),
+                total,
                 event = "init_packet_pass_incomplete",
                 "Plugin init pass did not complete"
             );
