@@ -304,6 +304,11 @@ impl Context {
             PluginEvent::SmsAttachmentReceived { .. } | PluginEvent::SmsAttachmentFailed { .. } => {
                 self.synchronize_attachments().await?;
             }
+            PluginEvent::ContactsChanged { .. } => {
+                if let Err(error) = self.synchronize_contacts().await {
+                    tracing::warn!(%error, "Contact cache synchronization failed");
+                }
+            }
             PluginEvent::Battery {
                 device_id,
                 current_charge,
@@ -343,7 +348,7 @@ impl Context {
         }
         Ok(())
     }
-    async fn synchronize_contacts(&self) -> crate::utils::Result<()> {
+    pub(crate) async fn synchronize_contacts(&self) -> crate::utils::Result<()> {
         for device in self.app.registry.list().await {
             if !self.app.pairing_handler.is_paired(&device.id).await {
                 continue;
@@ -756,8 +761,8 @@ impl DBusService {
             if let Err(error) = context.resynchronize(true).await {
                 tracing::warn!(%error, "Could not restore active phone notifications");
             }
-            let mut refresh = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
+                let settle = context.next_settle().await;
                 let result = tokio::select! {
                     _=stopped.cancelled()=>break,
                     owner=owners.next()=> {
@@ -795,11 +800,14 @@ impl DBusService {
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => context.resynchronize(false).await,
                         Err(_) => break,
                     },
-                    _=refresh.tick()=> {
-                        if let Err(error)=context.synchronize_contacts().await {tracing::warn!(%error,"Contact cache synchronization failed");}
+                    _ = async {
+                        match settle {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
                         if let Err(error)=context.settle_threads().await {tracing::warn!(%error,"Conversation removal check failed");}
-                        if let Err(error)=context.settle_notifications().await {tracing::warn!(%error,"Notification reconciliation failed");}
-                        context.synchronize_devices().await
+                        context.settle_notifications().await
                     },
                 };
                 if let Err(error) = result {

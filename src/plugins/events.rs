@@ -101,6 +101,10 @@ pub enum PluginEvent {
         messages: Vec<crate::plugins::sms::SmsMessage>,
         created_threads: Vec<i64>,
     },
+    /// A phone's contacts changed, or stopped waiting for cards it never sent.
+    ContactsChanged {
+        device_id: String,
+    },
     SmsAttachmentFailed {
         device_id: String,
         unique_identifier: String,

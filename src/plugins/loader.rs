@@ -83,7 +83,7 @@ pub fn load_default_plugins(
         findmyphone: Arc::new(super::FindMyPhonePlugin::new()),
         findthisdevice: Arc::new(super::FindThisDevicePlugin::new()),
         presenter: Arc::new(presenter),
-        contacts: Arc::new(super::ContactsPlugin::new()),
+        contacts: Arc::new(super::ContactsPlugin::new().with_events(plugin_events.clone())),
         runcommand: Arc::new(super::RuncommandPlugin::new()),
         sendnotifications: Arc::new(
             super::SendNotificationsPlugin::new(plugin_events.clone(), pairing_handler.clone())

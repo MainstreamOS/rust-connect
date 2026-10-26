@@ -103,6 +103,7 @@ pub struct ContactsPlugin {
     /// device_id -> per-device state
     devices: Arc<StdRwLock<HashMap<String, DeviceContacts>>>,
     revision: AtomicU64,
+    events: Option<Arc<super::PluginEventBroadcaster>>,
 }
 
 impl Default for ContactsPlugin {
@@ -116,6 +117,37 @@ impl ContactsPlugin {
         Self {
             devices: Arc::new(StdRwLock::new(HashMap::new())),
             revision: AtomicU64::new(1),
+            events: None,
+        }
+    }
+
+    pub fn with_events(mut self, events: Arc<super::PluginEventBroadcaster>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Tell listeners the device's contacts may have changed, and again once
+    /// any cards still outstanding stop holding the mirror back.
+    fn changed(&self, device_id: &str) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        let event = super::PluginEvent::ContactsChanged {
+            device_id: device_id.to_string(),
+        };
+        events.broadcast(event.clone());
+        let waiting = self
+            .devices
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .is_some_and(|state| !state.pending.is_empty());
+        if waiting {
+            let events = events.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(PENDING_VCARDS_WAIT).await;
+                events.broadcast(event);
+            });
         }
     }
 
@@ -438,6 +470,7 @@ impl Plugin for ContactsPlugin {
                     "Received contact uids/timestamps from device"
                 );
 
+                self.changed(device_id);
                 if to_fetch.is_empty() {
                     Ok(None)
                 } else {
@@ -519,6 +552,8 @@ impl Plugin for ContactsPlugin {
                     event = "contacts_vcards_received",
                     "Stored contact vCards from device"
                 );
+                drop(devices);
+                self.changed(device_id);
                 Ok(None)
             }
             _ => Ok(None),

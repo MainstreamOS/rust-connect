@@ -92,6 +92,7 @@ fn kind(event: &ServerEvent) -> &'static str {
             PluginEvent::Notification { .. } => "plugin.notification",
             PluginEvent::SmsMessagesReceived { .. } => "plugin.sms_messages_received",
             PluginEvent::SmsAttachmentFailed { .. } => "plugin.sms_attachment_failed",
+            PluginEvent::ContactsChanged { .. } => "plugin.contacts_changed",
             PluginEvent::SmsAttachmentReceived { .. } => "plugin.sms_attachment_received",
             PluginEvent::Battery { .. } => "plugin.battery",
             PluginEvent::MprisUpdate { .. } => "plugin.mpris_update",

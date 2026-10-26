@@ -12,7 +12,7 @@ use zbus::{
 
 /// How long a reconnected phone's notifications must stop arriving before
 /// the ones it did not send again count as dismissed.
-const NOTIFICATION_SYNC_QUIET: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const NOTIFICATION_SYNC_QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The event that withdraws a notification from the desktop.
 pub(crate) fn cancelled(device: &str, id: String) -> PluginEvent {

@@ -268,8 +268,33 @@ impl Context {
         }
         Ok(())
     }
+    /// When the next pending thread or notification settle is due.
+    pub(crate) async fn next_settle(&self) -> Option<tokio::time::Instant> {
+        let threads = self
+            .thread_syncs
+            .lock()
+            .await
+            .values()
+            .map(|sync| sync.last + THREAD_SYNC_QUIET)
+            .min();
+        let notifications = self
+            .notification_syncs
+            .lock()
+            .await
+            .values()
+            .map(|last| *last + super::notifications::NOTIFICATION_SYNC_QUIET)
+            .min();
+        threads
+            .into_iter()
+            .chain(notifications)
+            .min()
+            .map(tokio::time::Instant::from_std)
+    }
     pub(crate) async fn resynchronize(self: &Arc<Self>, startup: bool) -> zbus::Result<()> {
         self.synchronize_devices().await?;
+        if let Err(error) = self.synchronize_contacts().await {
+            tracing::warn!(%error, "Contact cache synchronization failed");
+        }
         for device in self.app.registry.list().await {
             let paired = self.app.pairing_handler.is_paired(&device.id).await;
             let connected = self.app.connection_manager.is_connected(&device.id).await;
