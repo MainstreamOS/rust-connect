@@ -14,6 +14,44 @@ use zbus::{
 /// the ones it did not send again count as dismissed.
 pub(super) const NOTIFICATION_SYNC_QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a reconnected phone may take to start sending its notifications
+/// again before it counts as having none. It answers only after the rest of
+/// its connect-time traffic, which can take more than half a minute.
+pub(super) const NOTIFICATION_RESEND_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// Where a reconnected phone is in sending its active notifications again.
+#[derive(Clone, Copy)]
+pub(super) struct NotificationSync {
+    connected: std::time::Instant,
+    /// The last notification since the resend began, which is with the first
+    /// silent one: the phone marks what it sends again as silent.
+    last: Option<std::time::Instant>,
+}
+
+impl NotificationSync {
+    pub(super) fn new() -> Self {
+        Self {
+            connected: std::time::Instant::now(),
+            last: None,
+        }
+    }
+
+    pub(super) fn heard(&mut self, silent: bool) {
+        if silent || self.last.is_some() {
+            self.last = Some(std::time::Instant::now());
+        }
+    }
+
+    /// When what the phone has not sent again counts as dismissed.
+    pub(super) fn due(&self) -> std::time::Instant {
+        match self.last {
+            Some(last) => last + NOTIFICATION_SYNC_QUIET,
+            None => self.connected + NOTIFICATION_RESEND_WAIT,
+        }
+    }
+}
+
 /// The event that withdraws a notification from the desktop.
 pub(crate) fn cancelled(device: &str, id: String) -> PluginEvent {
     PluginEvent::Notification {
@@ -118,7 +156,7 @@ impl Context {
             let mut syncs = self.notification_syncs.lock().await;
             let quiet: Vec<String> = syncs
                 .iter()
-                .filter(|(_, last)| last.elapsed() >= NOTIFICATION_SYNC_QUIET)
+                .filter(|(_, sync)| sync.due() <= std::time::Instant::now())
                 .map(|(device, _)| device.clone())
                 .collect();
             for device in &quiet {

@@ -2001,7 +2001,7 @@ async fn notifications_dismissed_while_the_phone_was_away_close_after_it_reconne
             .unwrap();
     }
     until(|| async { active().await == 2 }).await;
-    // Back online, the phone sends again only what it still shows.
+    // Back online, the phone sends again only what it still shows, as silent.
     app.plugins.notification.on_disconnected(PHONE).await;
     app.broadcaster
         .broadcast(rust_connect::device::DeviceEvent::StateChanged {
@@ -2011,7 +2011,7 @@ async fn notifications_dismissed_while_the_phone_was_away_close_after_it_reconne
         });
     app.plugins
         .notification
-        .handle_packet(PHONE, post("kept"))
+        .handle_packet(PHONE, resent("kept"))
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -2021,6 +2021,94 @@ async fn notifications_dismissed_while_the_phone_was_away_close_after_it_reconne
     })
     .await
     .unwrap();
+    service.stop().await;
+}
+
+/// The phone's notifications sent again on reconnect, marked silent as Android marks them.
+fn resent(id: &str) -> Packet {
+    Packet::new(
+        "kdeconnect.notification".into(),
+        serde_json::json!({"id":id,"appName":"Mail","text":id,"silent":true}),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phone_that_resends_its_notifications_late_does_not_lose_them() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let _phone = loopback_phone(&app).await;
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let client = bus.connect(None).await;
+    let proxy = zbus::Proxy::new(
+        &client,
+        "org.kde.kdeconnect",
+        "/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa/notifications",
+        "org.kde.kdeconnect.device.notifications",
+    )
+    .await
+    .unwrap();
+    let post = |id: &str| {
+        Packet::new(
+            "kdeconnect.notification".into(),
+            serde_json::json!({"id":id,"appName":"Mail","text":id}),
+        )
+    };
+    let active = || async {
+        proxy
+            .call::<_, _, Vec<String>>("activeNotifications", &())
+            .await
+            .unwrap()
+            .len()
+    };
+    for id in ["kept", "dismissed"] {
+        app.plugins
+            .notification
+            .handle_packet(PHONE, post(id))
+            .await
+            .unwrap();
+    }
+    until(|| async { active().await == 2 }).await;
+    app.plugins.notification.on_disconnected(PHONE).await;
+    app.broadcaster
+        .broadcast(rust_connect::device::DeviceEvent::StateChanged {
+            device_id: PHONE.into(),
+            old_state: rust_connect::device::DeviceState::Disconnected,
+            new_state: rust_connect::device::DeviceState::Connected,
+        });
+    // A new notification first, then a long silence while the phone syncs
+    // other things: neither starts the count that closes what was not resent.
+    app.plugins
+        .notification
+        .handle_packet(PHONE, post("new"))
+        .await
+        .unwrap();
+    until(|| async { active().await == 3 }).await;
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    assert_eq!(
+        active().await,
+        3,
+        "nothing may close before the phone resends"
+    );
+    app.plugins
+        .notification
+        .handle_packet(PHONE, resent("kept"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while active().await != 2 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the one the late resend left out closes");
     service.stop().await;
 }
 

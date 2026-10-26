@@ -48,9 +48,9 @@ pub(crate) struct Context {
     contact_revisions: Mutex<HashMap<String, u64>>,
     watched_threads: Mutex<HashSet<(String, i64)>>,
     known_threads: Mutex<HashMap<String, HashSet<i64>>>,
-    /// When each reconnected device last sent a notification, until
-    /// `settle_notifications` drops the ones it no longer has.
-    notification_syncs: Mutex<HashMap<String, std::time::Instant>>,
+    /// How far each reconnected device is in sending its notifications again,
+    /// until `settle_notifications` drops the ones it no longer has.
+    notification_syncs: Mutex<HashMap<String, notifications::NotificationSync>>,
     /// When a failed contact mirror is next tried, and the wait that led there.
     contact_retry: Mutex<Option<(std::time::Instant, std::time::Duration)>>,
     call_revisions: Mutex<HashMap<String, u64>>,
@@ -318,10 +318,14 @@ impl Context {
                 )
                 .await?
             }
-            PluginEvent::Notification { ref device_id, .. } => {
+            PluginEvent::Notification {
+                ref device_id,
+                silent,
+                ..
+            } => {
                 self.register(device_id).await?;
-                if let Some(last) = self.notification_syncs.lock().await.get_mut(device_id) {
-                    *last = std::time::Instant::now();
+                if let Some(sync) = self.notification_syncs.lock().await.get_mut(device_id) {
+                    sync.heard(silent);
                 }
                 self.notification_event(event).await?;
             }
@@ -442,7 +446,7 @@ impl Context {
             self.notification_syncs
                 .lock()
                 .await
-                .insert(device.clone(), std::time::Instant::now());
+                .insert(device.clone(), notifications::NotificationSync::new());
         }
         if removed {
             self.unregister(&device).await;

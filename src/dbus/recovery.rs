@@ -146,7 +146,7 @@ impl Context {
             .lock()
             .await
             .values()
-            .map(|last| *last + super::notifications::NOTIFICATION_SYNC_QUIET)
+            .map(|sync| sync.due())
             .min();
         let contacts = self.contact_retry.lock().await.map(|(due, _)| due);
         notifications
