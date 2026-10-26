@@ -10,6 +10,30 @@ use zbus::{
     zvariant::{OwnedValue, Str},
 };
 
+/// How long a reconnected phone's notifications must stop arriving before
+/// the ones it did not send again count as dismissed.
+const NOTIFICATION_SYNC_QUIET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The event that withdraws a notification from the desktop.
+pub(crate) fn cancelled(device: &str, id: String) -> PluginEvent {
+    PluginEvent::Notification {
+        device_id: device.into(),
+        id,
+        app_name: String::new(),
+        title: String::new(),
+        text: String::new(),
+        ticker: None,
+        is_cancel: true,
+        silent: true,
+        actions: None,
+        conversation: None,
+        group_name: None,
+        reply_id: None,
+        icon_hash: None,
+        icon_url: None,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Record {
     pub device: String,
@@ -64,23 +88,7 @@ impl Context {
             .cloned()
             .collect();
         for (device_id, id) in stale {
-            self.notification_event(PluginEvent::Notification {
-                device_id,
-                id,
-                app_name: String::new(),
-                title: String::new(),
-                text: String::new(),
-                ticker: None,
-                is_cancel: true,
-                silent: true,
-                actions: None,
-                conversation: None,
-                group_name: None,
-                reply_id: None,
-                icon_hash: None,
-                icon_url: None,
-            })
-            .await?;
+            self.notification_event(cancelled(&device_id, id)).await?;
         }
         for n in entries {
             self.notification_event(PluginEvent::Notification {
@@ -100,6 +108,46 @@ impl Context {
                 icon_url: n.icon_url,
             })
             .await?;
+        }
+        Ok(())
+    }
+    /// Withdraw what a reconnected phone dismissed while it was away: it sends
+    /// every active notification again when asked at connect.
+    pub(crate) async fn settle_notifications(self: &Arc<Self>) -> zbus::Result<()> {
+        let settled: Vec<String> = {
+            let mut syncs = self.notification_syncs.lock().await;
+            let quiet: Vec<String> = syncs
+                .iter()
+                .filter(|(_, last)| last.elapsed() >= NOTIFICATION_SYNC_QUIET)
+                .map(|(device, _)| device.clone())
+                .collect();
+            for device in &quiet {
+                syncs.remove(device);
+            }
+            quiet
+        };
+        for device in settled {
+            if !self.app.connection_manager.is_connected(&device).await {
+                continue;
+            }
+            let stale: Vec<String> = self
+                .notifications
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .filter(|record| record.device == device && !record.id.starts_with("call:"))
+                .filter(|record| {
+                    self.app
+                        .plugins
+                        .notification
+                        .active_notification(&device, &record.id)
+                        .is_none()
+                })
+                .map(|record| record.id.clone())
+                .collect();
+            for id in stale {
+                self.notification_event(cancelled(&device, id)).await?;
+            }
         }
         Ok(())
     }

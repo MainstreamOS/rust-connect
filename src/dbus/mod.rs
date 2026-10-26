@@ -50,6 +50,9 @@ pub(crate) struct Context {
     known_threads: Mutex<HashMap<String, HashSet<i64>>>,
     /// When each device last sent messages, until `settle_threads` checks it.
     thread_syncs: Mutex<HashMap<String, std::time::Instant>>,
+    /// When each reconnected device last sent a notification, until
+    /// `settle_notifications` drops the ones it no longer has.
+    notification_syncs: Mutex<HashMap<String, std::time::Instant>>,
     call_revisions: Mutex<HashMap<String, u64>>,
     attachment_revisions: Mutex<HashMap<(String, String), u64>>,
 }
@@ -316,6 +319,9 @@ impl Context {
             }
             PluginEvent::Notification { ref device_id, .. } => {
                 self.register(device_id).await?;
+                if let Some(last) = self.notification_syncs.lock().await.get_mut(device_id) {
+                    *last = std::time::Instant::now();
+                }
                 self.notification_event(event).await?;
             }
             PluginEvent::TelephonyUpdate { device_id, .. } => {
@@ -398,6 +404,14 @@ impl Context {
                 | DeviceEvent::Unpaired { .. }
                 | DeviceEvent::Removed { .. }
         );
+        let connected = matches!(
+            &event,
+            DeviceEvent::Connected { .. }
+                | DeviceEvent::StateChanged {
+                    new_state: crate::device::DeviceState::Connected,
+                    ..
+                }
+        );
         let removed = matches!(&event, DeviceEvent::Removed { .. });
         let revoked = removed || matches!(&event, DeviceEvent::Unpaired { .. });
         let device = match event {
@@ -422,6 +436,12 @@ impl Context {
         }
         if revoked {
             self.forget_device(&device).await;
+        }
+        if connected {
+            self.notification_syncs
+                .lock()
+                .await
+                .insert(device.clone(), std::time::Instant::now());
         }
         if removed {
             self.unregister(&device).await;
@@ -556,24 +576,11 @@ impl Context {
             .map(|record| record.id.clone())
             .collect();
         for id in ids {
-            let event = PluginEvent::Notification {
-                device_id: device.into(),
-                id,
-                app_name: String::new(),
-                title: String::new(),
-                text: String::new(),
-                ticker: None,
-                is_cancel: true,
-                silent: true,
-                actions: None,
-                conversation: None,
-                group_name: None,
-                reply_id: None,
-                icon_hash: None,
-                icon_url: None,
-            };
-            let _ = self.notification_event(event).await;
+            let _ = self
+                .notification_event(notifications::cancelled(device, id))
+                .await;
         }
+        self.notification_syncs.lock().await.remove(device);
         self.trusted.lock().await.remove(device);
         self.contact_revisions.lock().await.remove(device);
         self.watched_threads
@@ -701,6 +708,7 @@ impl DBusService {
             watched_threads: Mutex::new(HashSet::new()),
             known_threads: Mutex::new(HashMap::new()),
             thread_syncs: Mutex::new(HashMap::new()),
+            notification_syncs: Mutex::new(HashMap::new()),
             call_revisions: Mutex::new(HashMap::new()),
             attachment_revisions: Mutex::new(HashMap::new()),
         });
@@ -781,6 +789,7 @@ impl DBusService {
                     _=refresh.tick()=> {
                         if let Err(error)=context.synchronize_contacts().await {tracing::warn!(%error,"Contact cache synchronization failed");}
                         if let Err(error)=context.settle_threads().await {tracing::warn!(%error,"Conversation removal check failed");}
+                        if let Err(error)=context.settle_notifications().await {tracing::warn!(%error,"Notification reconciliation failed");}
                         context.synchronize_devices().await
                     },
                 };

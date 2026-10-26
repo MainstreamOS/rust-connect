@@ -27,23 +27,8 @@ impl Context {
         let id = format!("call:{device}");
         let cancel = info.is_cancel || info.event == "talking";
         if cancel {
-            self.notification_event(PluginEvent::Notification {
-                device_id: device.into(),
-                id,
-                app_name: String::new(),
-                title: String::new(),
-                text: String::new(),
-                ticker: None,
-                is_cancel: true,
-                silent: true,
-                actions: None,
-                conversation: None,
-                group_name: None,
-                reply_id: None,
-                icon_hash: None,
-                icon_url: None,
-            })
-            .await?;
+            self.notification_event(super::notifications::cancelled(device, id))
+                .await?;
             self.calls.lock().await.remove(device);
             return Ok(());
         }

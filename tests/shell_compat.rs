@@ -1831,6 +1831,73 @@ async fn notification_icons_follow_exact_updates_and_late_cache_availability() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notifications_dismissed_while_the_phone_was_away_close_after_it_reconnects() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let _phone = loopback_phone(&app).await;
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let client = bus.connect(None).await;
+    let proxy = zbus::Proxy::new(
+        &client,
+        "org.kde.kdeconnect",
+        "/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa/notifications",
+        "org.kde.kdeconnect.device.notifications",
+    )
+    .await
+    .unwrap();
+    let post = |id: &str| {
+        Packet::new(
+            "kdeconnect.notification".into(),
+            serde_json::json!({"id":id,"appName":"Mail","text":id}),
+        )
+    };
+    let active = || async {
+        proxy
+            .call::<_, _, Vec<String>>("activeNotifications", &())
+            .await
+            .unwrap()
+            .len()
+    };
+    for id in ["kept", "dismissed"] {
+        app.plugins
+            .notification
+            .handle_packet(PHONE, post(id))
+            .await
+            .unwrap();
+    }
+    until(|| async { active().await == 2 }).await;
+    // Back online, the phone sends again only what it still shows.
+    app.plugins.notification.on_disconnected(PHONE).await;
+    app.broadcaster
+        .broadcast(rust_connect::device::DeviceEvent::StateChanged {
+            device_id: PHONE.into(),
+            old_state: rust_connect::device::DeviceState::Disconnected,
+            new_state: rust_connect::device::DeviceState::Connected,
+        });
+    app.plugins
+        .notification
+        .handle_packet(PHONE, post("kept"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while active().await != 1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    service.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reconnect_burst_does_not_report_conversations_as_removed() {
     let bus = Bus::new();
     let temp = tempfile::tempdir().unwrap();
