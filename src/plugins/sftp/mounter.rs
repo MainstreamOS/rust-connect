@@ -98,9 +98,15 @@ pub trait CommandRunner: Send + Sync {
     }
 }
 
-/// How long a session mount may take to appear before it counts as failed.
-/// Matches the plugin's own `MOUNT_TIMEOUT`.
-const SESSION_MOUNT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a session mount may take, from the start, before it counts as
+/// failed. Under the plugin's 10 second `MOUNT_TIMEOUT`, so a slow mount is
+/// stopped here before the plugin gives up and reports it failed.
+const SESSION_MOUNT_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long the stop of an abandoned mount's unit may take to be queued,
+/// after `SESSION_MOUNT_WAIT` has run out. Together they stay under the
+/// plugin's `MOUNT_TIMEOUT`.
+const STOP_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
@@ -125,11 +131,53 @@ impl SystemCommandRunner {
         }
     }
 
-    /// Stop a session mount's unit. `None` when systemctl is missing.
-    fn stop_unit(&self, unit: &str) -> Option<CommandOutput> {
+    /// Stop a session mount's unit, waiting no later than `deadline`.
+    /// `queue` only hands systemd the stop instead of waiting for the unit to
+    /// go. `None` when systemctl is missing or did not finish in time.
+    fn stop_unit(
+        &self,
+        unit: &str,
+        queue: bool,
+        deadline: std::time::Instant,
+    ) -> Option<CommandOutput> {
         let systemctl = self.which("systemctl")?;
-        let args = ["--user", "stop", unit].map(OsString::from);
-        self.run_with_stdin(&systemctl, &args, None).ok()
+        let mut args = vec![OsString::from("--user"), OsString::from("stop")];
+        if queue {
+            args.push(OsString::from("--no-block"));
+        }
+        args.push(OsString::from(unit));
+        self.run_until(&systemctl, &args, deadline)
+    }
+
+    /// Run a command with no stdin until it exits or `deadline` passes, when
+    /// it is killed. `None` when it could not start or ran out of time.
+    fn run_until(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        deadline: std::time::Instant,
+    ) -> Option<CommandOutput> {
+        let mut child = self.make_command(program, args).spawn().ok()?;
+        drop(child.stdin.take());
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let output = child.wait_with_output().ok()?;
+        Some(CommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 
     /// Build a Command whose argv and env are pre-validated. The caller
@@ -232,8 +280,16 @@ impl CommandRunner for SystemCommandRunner {
         else {
             return self.run_with_stdin(program, args, Some(password));
         };
-        // A unit left by an earlier run would still hold the name.
-        self.stop_unit(unit);
+        let deadline = std::time::Instant::now() + SESSION_MOUNT_WAIT;
+        // A unit left by an earlier run would still hold the name, so it has
+        // to be gone before the new one starts, within the same budget.
+        if self.which("systemctl").is_some() && self.stop_unit(unit, false, deadline).is_none() {
+            return Ok(CommandOutput {
+                status: -1,
+                stdout: String::new(),
+                stderr: "an earlier mount did not stop in time".to_string(),
+            });
+        }
 
         let mut argv: Vec<OsString> = ["--user", "--quiet", "--collect", "--pipe"]
             .map(OsString::from)
@@ -266,7 +322,6 @@ impl CommandRunner for SystemCommandRunner {
                 let _ = child.wait_with_output();
             });
         };
-        let deadline = std::time::Instant::now() + SESSION_MOUNT_WAIT;
         loop {
             if mounted() {
                 reap(child);
@@ -296,7 +351,9 @@ impl CommandRunner for SystemCommandRunner {
                 });
             }
             if std::time::Instant::now() >= deadline {
-                self.stop_unit(unit);
+                // The next mount waits for the unit to be gone before it
+                // starts another, so the stop only has to be queued here.
+                self.stop_unit(unit, true, std::time::Instant::now() + STOP_QUEUE_WAIT);
                 reap(child);
                 return Ok(CommandOutput {
                     status: -1,
@@ -313,7 +370,8 @@ impl CommandRunner for SystemCommandRunner {
         // here too. A mount from before units (or a unit already gone) falls
         // through to fusermount.
         if self.session_units {
-            if let Some(output) = self.stop_unit(unit) {
+            let deadline = std::time::Instant::now() + SESSION_MOUNT_WAIT;
+            if let Some(output) = self.stop_unit(unit, false, deadline) {
                 if output.status == 0 {
                     return Ok(output);
                 }
@@ -492,6 +550,18 @@ impl Mounter {
                 req.mount_point.display(),
                 e
             )));
+        }
+
+        // A mount left here, by an older daemon or a unit that is gone, would
+        // read as this one succeeding while the new sshfs fails.
+        if is_mount_point(&req.mount_point) {
+            let _ = self.unmount(&req.mount_point);
+            if is_mount_point(&req.mount_point) {
+                return Ok(MountOutcome::Failed(format!(
+                    "mount point {} is still in use by an earlier mount",
+                    req.mount_point.display()
+                )));
+            }
         }
 
         let args = build_sshfs_args(req);
@@ -752,6 +822,31 @@ mod tests {
         // not embed the password in the path component either.
         let user_host = format!("{}@{}:{}", req.user, req.ip, req.path);
         assert_eq!(argv_str[0], user_host);
+    }
+
+    #[test]
+    fn a_mount_point_still_in_use_is_not_reported_as_mounted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let log = dir.path().join("sshfs.argv");
+        write_fake_sshfs(&bin_dir, &log);
+        write_fake_fusermount(
+            &bin_dir,
+            &dir.path().join("fusermount3.argv"),
+            "fusermount3",
+        );
+        let mounter = Mounter::new(std::sync::Arc::new(SingleDirRunner { dir: bin_dir }));
+        // /proc is always mounted, as a stale sshfs mount would be.
+        let req = MountRequest {
+            mount_point: PathBuf::from("/proc"),
+            ..make_request()
+        };
+        match mounter.mount(&req, "secret").expect("mount call") {
+            MountOutcome::Failed(error) => assert!(error.contains("still in use"), "{error}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!log.exists(), "sshfs must not run over a live mount");
     }
 
     #[test]
@@ -1031,6 +1126,74 @@ mod tests {
             .expect("run_mount");
         assert_ne!(output.status, 0);
         assert!(output.stderr.contains("Connection reset by peer"));
+    }
+
+    /// Replace one of the `session_fakes` programs.
+    fn replace_fake(bin: &Path, name: &str, body: &str) {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(bin.join(name))
+            .expect("create fake");
+        f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("write fake");
+        drop(f);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    /// Every unit stop takes three seconds and sshfs never mounts: the
+    /// attempt still ends before the plugin's own timeout gives up on it.
+    #[test]
+    fn session_mount_gives_up_within_the_plugins_timeout_when_unit_stops_are_slow() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bin = session_fakes(dir.path());
+        replace_fake(&bin, "systemctl", "exec sleep 3");
+        replace_fake(&bin, "systemd-run", "cat > /dev/null\nexec sleep 9");
+        let runner = session_runner(&bin);
+        let start = std::time::Instant::now();
+        let output = runner
+            .run_mount(
+                "rust-connect-sftp-dev1",
+                Path::new("/usr/bin/sshfs"),
+                &build_sshfs_args(&make_request()),
+                "secret",
+                &|| false,
+            )
+            .expect("run_mount");
+        assert!(
+            start.elapsed() < crate::plugins::sftp::MOUNT_TIMEOUT,
+            "took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(output.stderr, "sshfs did not mount in time");
+    }
+
+    /// An earlier unit that will not stop within the budget means no new
+    /// mount is started after the caller's time has already run out.
+    #[test]
+    fn session_mount_does_not_start_once_the_earlier_unit_used_up_its_time() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bin = session_fakes(dir.path());
+        replace_fake(&bin, "systemctl", "exec sleep 30");
+        let runner = session_runner(&bin);
+        let start = std::time::Instant::now();
+        let output = runner
+            .run_mount(
+                "rust-connect-sftp-dev1",
+                Path::new("/usr/bin/sshfs"),
+                &build_sshfs_args(&make_request()),
+                "secret",
+                &|| false,
+            )
+            .expect("run_mount");
+        assert!(start.elapsed() < crate::plugins::sftp::MOUNT_TIMEOUT);
+        assert_ne!(output.status, 0);
+        assert!(
+            !dir.path().join("run.argv").exists(),
+            "systemd-run must not be started"
+        );
     }
 
     #[test]
