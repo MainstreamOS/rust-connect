@@ -51,6 +51,8 @@ pub(crate) struct Context {
     /// When each reconnected device last sent a notification, until
     /// `settle_notifications` drops the ones it no longer has.
     notification_syncs: Mutex<HashMap<String, std::time::Instant>>,
+    /// When a failed contact mirror is next tried, and the wait that led there.
+    contact_retry: Mutex<Option<(std::time::Instant, std::time::Duration)>>,
     call_revisions: Mutex<HashMap<String, u64>>,
     attachment_revisions: Mutex<HashMap<(String, String), u64>>,
 }
@@ -302,11 +304,7 @@ impl Context {
             PluginEvent::SmsAttachmentReceived { .. } | PluginEvent::SmsAttachmentFailed { .. } => {
                 self.synchronize_attachments().await?;
             }
-            PluginEvent::ContactsChanged { .. } => {
-                if let Err(error) = self.synchronize_contacts().await {
-                    tracing::warn!(%error, "Contact cache synchronization failed");
-                }
-            }
+            PluginEvent::ContactsChanged { .. } => self.mirror_contacts().await,
             PluginEvent::Battery {
                 device_id,
                 current_charge,
@@ -736,6 +734,7 @@ impl DBusService {
             watched_threads: Mutex::new(HashSet::new()),
             known_threads: Mutex::new(HashMap::new()),
             notification_syncs: Mutex::new(HashMap::new()),
+            contact_retry: Mutex::new(None),
             call_revisions: Mutex::new(HashMap::new()),
             attachment_revisions: Mutex::new(HashMap::new()),
         });
@@ -819,7 +818,7 @@ impl DBusService {
                             None => std::future::pending().await,
                         }
                     } => {
-                        context.settle_notifications().await
+                        context.run_due().await
                     },
                 };
                 if let Err(error) = result {

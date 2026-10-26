@@ -3,6 +3,10 @@
 use super::{compat, Context, ROOT};
 use std::{collections::HashSet, sync::Arc};
 
+/// The first wait before a failed contact mirror is tried again, and the longest.
+const CONTACT_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
+const CONTACT_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Context {
     /// Add the device's current threads to those the shell has been told
     /// about. None is ever reported removed: the phone sends its conversations
@@ -135,21 +139,49 @@ impl Context {
         }
         Ok(())
     }
-    /// When the next pending notification settle is due.
+    /// When the next notification settle or contact retry is due.
     pub(crate) async fn next_settle(&self) -> Option<tokio::time::Instant> {
-        self.notification_syncs
+        let notifications = self
+            .notification_syncs
             .lock()
             .await
             .values()
             .map(|last| *last + super::notifications::NOTIFICATION_SYNC_QUIET)
+            .min();
+        let contacts = self.contact_retry.lock().await.map(|(due, _)| due);
+        notifications
+            .into_iter()
+            .chain(contacts)
             .min()
             .map(tokio::time::Instant::from_std)
     }
+    /// Run whatever `next_settle` said was due.
+    pub(crate) async fn run_due(self: &Arc<Self>) -> zbus::Result<()> {
+        let retry = self
+            .contact_retry
+            .lock()
+            .await
+            .is_some_and(|(due, _)| due <= std::time::Instant::now());
+        if retry {
+            self.mirror_contacts().await;
+        }
+        self.settle_notifications().await
+    }
+    /// Mirror the phones' contacts for the shell. A failed write is tried
+    /// again with growing waits, since nothing else may change to prompt it.
+    pub(crate) async fn mirror_contacts(&self) {
+        let failed = self.synchronize_contacts().await.err();
+        let mut retry = self.contact_retry.lock().await;
+        *retry = failed.map(|error| {
+            let wait = retry.map_or(CONTACT_RETRY_FIRST, |(_, last)| {
+                (last * 2).min(CONTACT_RETRY_MAX)
+            });
+            tracing::warn!(%error, retry_secs = wait.as_secs(), "Contact cache synchronization failed; will retry");
+            (std::time::Instant::now() + wait, wait)
+        });
+    }
     pub(crate) async fn resynchronize(self: &Arc<Self>, startup: bool) -> zbus::Result<()> {
         self.synchronize_devices().await?;
-        if let Err(error) = self.synchronize_contacts().await {
-            tracing::warn!(%error, "Contact cache synchronization failed");
-        }
         for device in self.app.registry.list().await {
             let paired = self.app.pairing_handler.is_paired(&device.id).await;
             let connected = self.app.connection_manager.is_connected(&device.id).await;
@@ -206,9 +238,7 @@ impl Context {
             .await?;
         }
         self.synchronize_attachments().await?;
-        if let Err(error) = self.synchronize_contacts().await {
-            tracing::warn!(%error,"Contact cache recovery failed; will retry");
-        }
+        self.mirror_contacts().await;
         self.resynchronize_notifications().await?;
         self.emit_at(ROOT, "org.kde.kdeconnect.daemon", "deviceListChanged", &())
             .await

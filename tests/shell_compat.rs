@@ -2795,3 +2795,53 @@ async fn a_discovered_device_gets_its_dbus_object_without_a_connection() {
     service.stop().await;
     assert!(found.is_ok(), "the discovered device has no D-Bus object");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_contact_mirror_recovers_after_a_failed_write() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let _phone = loopback_phone(&app).await;
+    let root = temp.path().join("contacts");
+    let directory = root.join(format!("kdeconnect-{PHONE}"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let stale = directory.join("old.vcf");
+    std::fs::write(&stale, b"BEGIN:VCARD\nFN:Old contact\nEND:VCARD").unwrap();
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        root,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    // The mirror's folder is briefly unusable while an empty contact list arrives.
+    let aside = temp.path().join("contacts-aside");
+    std::fs::rename(&directory, &aside).unwrap();
+    std::fs::write(&directory, b"in the way").unwrap();
+    app.plugins
+        .contacts
+        .handle_packet(
+            PHONE,
+            Packet::new(
+                "kdeconnect.contacts.response_uids_timestamps".into(),
+                serde_json::json!({"uids": []}),
+            ),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    std::fs::remove_file(&directory).unwrap();
+    std::fs::rename(&aside, &directory).unwrap();
+    let recovered = tokio::time::timeout(Duration::from_secs(8), async {
+        while stale.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    service.stop().await;
+    assert!(
+        recovered.is_ok(),
+        "the mirror never retried its failed write"
+    );
+}
