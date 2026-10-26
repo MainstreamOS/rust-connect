@@ -2408,3 +2408,91 @@ async fn a_phone_asking_to_pair_can_be_accepted_or_declined_over_dbus() {
     .await
     .unwrap();
 }
+
+/// A clipboard backend whose watcher the test drives by hand.
+struct ManualClipboard {
+    sender: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+}
+impl rust_connect::plugins::clipboard::ClipboardBackend for ManualClipboard {
+    fn name(&self) -> &str {
+        "manual"
+    }
+    fn set(&self, _: &str) -> rust_connect::Result<()> {
+        Ok(())
+    }
+    fn spawn_watcher(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> rust_connect::Result<()> {
+        *self.sender.lock().unwrap() = Some(tx);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_clipboard_never_reaches_a_phone_that_is_not_paired() {
+    use rust_connect::protocol::{CertificateManager, ConnectionManager, Identity};
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    app.cert_manager
+        .ensure_own_certificate(DESKTOP, "Desktop")
+        .unwrap();
+    app.connection_manager
+        .set_device_identity(DESKTOP, "Desktop");
+    let local = Identity::new(
+        DESKTOP.into(),
+        "Desktop".into(),
+        DeviceType::Desktop,
+        vec!["kdeconnect.clipboard".into()],
+        vec!["kdeconnect.clipboard".into()],
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stop = cancel.clone();
+    let service = rust_connect::protocol::listener::TcpListenerService::new(app.clone(), local);
+    let task = tokio::spawn(async move { service.run_from_bound(listener, stop).await.unwrap() });
+    // A peer that completed the TLS handshake but never paired.
+    let stranger_dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(CertificateManager::new(stranger_dir.path().into()));
+    certs.init().unwrap();
+    certs.ensure_own_certificate(PHONE, "Never paired").unwrap();
+    let stranger = ConnectionManager::new(certs).unwrap();
+    stranger.set_device_identity(PHONE, "Never paired");
+    let identity = Identity::new(
+        PHONE.into(),
+        "Never paired".into(),
+        DeviceType::Phone,
+        vec!["kdeconnect.clipboard".into()],
+        vec!["kdeconnect.clipboard".into()],
+    );
+    stranger
+        .connect_to_device(&identity, addr, None)
+        .await
+        .unwrap();
+    until(|| async { app.connection_manager.is_connected(&PHONE.into()).await }).await;
+    assert!(!app.pairing_handler.is_paired(&PHONE.into()).await);
+    let sender = Arc::new(Mutex::new(None));
+    app.plugins.clipboard.set_backend(Arc::new(ManualClipboard {
+        sender: sender.clone(),
+    }));
+    sender
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send("synthetic clipboard text".into())
+        .unwrap();
+    let received = tokio::time::timeout(
+        Duration::from_millis(700),
+        stranger.recv_packet(&DESKTOP.into()),
+    )
+    .await;
+    cancel.cancel();
+    app.shutdown.cancel();
+    task.await.unwrap();
+    assert!(
+        received.is_err(),
+        "an unpaired peer received the desktop clipboard: {received:?}"
+    );
+}

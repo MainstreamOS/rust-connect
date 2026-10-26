@@ -21,6 +21,9 @@ pub(crate) mod tls;
 
 pub(crate) use tls::TlsStream;
 
+/// The pairing handler's live paired map, as `PairingHandler::paired_handle` shares it.
+type PairedIds = Arc<RwLock<HashMap<DeviceId, chrono::DateTime<chrono::Utc>>>>;
+
 pub(crate) struct Connection {
     pub(crate) read_stream: Mutex<BufReader<tokio::io::ReadHalf<TlsStream>>>,
     pub(crate) write_stream: Mutex<tokio::io::WriteHalf<TlsStream>>,
@@ -54,6 +57,9 @@ pub struct ConnectionManager {
     /// Phones the user disconnected. Automatic redials leave them alone until
     /// they connect again.
     held_devices: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
+    /// The pairing handler's live paired map (`PairingHandler::paired_handle`).
+    /// When wired, only pairing and identity packets reach unpaired peers.
+    paired_ids: Option<PairedIds>,
     /// Where each dropped phone is asked to dial back, with a count of how often
     /// a new drop has updated it (see `connection_orchestrator::spawn_dial_back_requests`).
     pub(crate) dial_back_targets: Arc<std::sync::Mutex<HashMap<DeviceId, (std::net::IpAddr, u64)>>>,
@@ -245,6 +251,7 @@ impl ConnectionManager {
             pending_connections: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             reconnecting_devices: Arc::new(std::sync::Mutex::new(HashMap::new())),
             held_devices: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            paired_ids: None,
             dial_back_targets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cert_manager,
             device_id: Arc::new(std::sync::RwLock::new(String::new())),
@@ -586,6 +593,17 @@ impl ConnectionManager {
         // test suite (see record_peer_capabilities's doc + the brief's
         // named call).
         if !packet.is_identity() && !packet.is_pair() {
+            if let Some(paired) = &self.paired_ids {
+                if !paired.read().await.contains_key(device_id) {
+                    debug!(
+                        device_id = %device_id,
+                        packet_type = %packet.packet_type,
+                        event = "send_refused_unpaired",
+                        "Refusing to send a non-pairing packet to an unpaired peer"
+                    );
+                    return Err(Error::DeviceNotPaired(device_id.clone()));
+                }
+            }
             let caps = self.peer_capabilities.read().await;
             if let Some(incoming) = caps.get(device_id) {
                 if !incoming.iter().any(|c| c == &packet.packet_type) {
@@ -886,6 +904,13 @@ impl ConnectionManager {
     /// generation has replaced it. On `false` the replacement owns the map
     /// slot, the cancel-token slot, and the lifecycle/plugin state, and the
     /// caller must not touch any of them.
+    /// Share the pairing handler's paired map, so desktop data is never sent
+    /// to a peer that has only completed the TLS handshake.
+    pub fn with_paired_source(mut self, paired: PairedIds) -> Self {
+        self.paired_ids = Some(paired);
+        self
+    }
+
     /// Mark a phone the user disconnected, so redials leave it alone.
     pub fn hold(&self, device_id: &DeviceId) {
         self.held_devices

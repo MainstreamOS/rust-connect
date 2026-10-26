@@ -83,7 +83,10 @@ impl AppState {
         );
         let lifecycle = Arc::new(LifecycleManager::new(registry.clone(), broadcaster.clone()));
 
-        let connection_manager = Arc::new(ConnectionManager::new(cert_manager.clone())?);
+        let connection_manager = Arc::new(
+            ConnectionManager::new(cert_manager.clone())?
+                .with_paired_source(pairing_handler.paired_handle()),
+        );
         let packet_router = Arc::new(PacketRouter::new());
         // Wire the connection manager so `notify_disconnected` stands
         // down when a same-cert replacement is already live for the
