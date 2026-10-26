@@ -323,6 +323,9 @@ impl RuncommandPlugin {
             }
         };
 
+        // Taken now: once the shell exits, `wait` reaps it and `child.id()`
+        // is gone, while children it left in the group may still be running.
+        let process_group = child.id();
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
         let collect = async {
@@ -389,7 +392,7 @@ impl RuncommandPlugin {
                 // pgid == pid. Processes that called setsid() themselves
                 // escape this — same as upstream, which does no group kill
                 // at all.
-                if let Some(pid) = child.id() {
+                if let Some(pid) = process_group {
                     // SAFETY: killpg on a process group we own (spawned by
                     // us as group leader); no memory safety involved. The
                     // return value is intentionally ignored — the group may
@@ -880,6 +883,31 @@ mod tests {
         assert!(
             !marker.exists(),
             "timeout killed only the shell; a background child survived to write the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_kills_children_the_shell_left_running() {
+        // As above, but the shell exits at once: its background child keeps
+        // the output pipe open, so the timeout comes after the shell is reaped.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("orphan-marker");
+        let cmd = format!("(sleep 0.4; touch {}) &", marker.display());
+        let plugin = RuncommandPlugin::new().with_execution_timeout(Duration::from_millis(100));
+        plugin.allow_command("device1", "orphan", "Orphan", &cmd);
+        plugin
+            .handle_packet(
+                "device1",
+                request_packet(serde_json::json!({ "key": "orphan" })),
+            )
+            .await
+            .unwrap();
+        plugin.wait_for_commands(1, 2000).await;
+        assert!(plugin.executed_commands()[0].stderr.contains("timed out"));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !marker.exists(),
+            "a child the shell left behind outlived the reported timeout"
         );
     }
 
