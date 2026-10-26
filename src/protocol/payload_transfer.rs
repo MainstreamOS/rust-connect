@@ -464,7 +464,7 @@ impl PayloadTransfer {
             .map_err(|e| Error::io(format!("Cannot read file metadata: {}", e), None))?
             .len();
 
-        let listener = self.find_free_port().await?;
+        let listener = self.find_free_port(local_ip).await?;
         let local_addr = listener
             .local_addr()
             .map_err(|e| Error::ConnectionError(format!("Cannot get listener address: {}", e)))?;
@@ -557,9 +557,15 @@ impl PayloadTransfer {
         Ok((transfer_info, handle))
     }
 
-    async fn find_free_port(&self) -> Result<TcpListener> {
+    /// Listens on the family of the address the peer is told to dial.
+    async fn find_free_port(&self, advertised: std::net::IpAddr) -> Result<TcpListener> {
+        let any: std::net::IpAddr = if advertised.is_ipv6() {
+            std::net::Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            std::net::Ipv4Addr::UNSPECIFIED.into()
+        };
         for port in TRANSFER_MIN_PORT..=TRANSFER_MAX_PORT {
-            match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+            match TcpListener::bind(std::net::SocketAddr::new(any, port)).await {
                 Ok(listener) => {
                     debug!(
                         port = port,
@@ -659,9 +665,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_an_ipv6_payload_address_is_listened_on() {
+        let (transfer, temp) = setup();
+        let file = temp.path().join("payload");
+        std::fs::write(&file, b"payload").unwrap();
+        let (info, task) = transfer
+            .send_file(&file, std::net::Ipv6Addr::LOCALHOST.into())
+            .await
+            .unwrap();
+        let connect = tokio::net::TcpStream::connect(("::1", info.port)).await;
+        task.abort();
+        assert!(
+            connect.is_ok(),
+            "nothing listens where the peer is told to dial: {connect:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_find_free_port_succeeds() {
         let (transfer, _temp) = setup();
-        let listener = transfer.find_free_port().await;
+        let listener = transfer
+            .find_free_port(std::net::Ipv4Addr::LOCALHOST.into())
+            .await;
         assert!(listener.is_ok());
         let port = listener
             .expect("Value expected to be present")
