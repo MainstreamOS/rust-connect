@@ -183,6 +183,25 @@ pub struct MprisInfo {
     pub transferring_album_art: bool,
 }
 
+impl MprisInfo {
+    /// This state with the fields an update carries. Phones send position,
+    /// volume and similar changes alone, and a field the packet leaves out
+    /// keeps its value; one it sends, even as null, replaces it.
+    fn updated_by(&self, body: &serde_json::Value) -> MprisInfo {
+        let Ok(mut state) = serde_json::to_value(self) else {
+            return self.clone();
+        };
+        if let (Some(fields), Some(update)) = (state.as_object_mut(), body.as_object()) {
+            for (key, value) in update {
+                if let Some(field) = fields.get_mut(key) {
+                    *field = value.clone();
+                }
+            }
+        }
+        serde_json::from_value(state).unwrap_or_else(|_| self.clone())
+    }
+}
+
 // =====================================================================
 // Control role (this daemon is the player host)
 // =====================================================================
@@ -831,7 +850,7 @@ impl MprisPlugin {
         device_id: &str,
         packet: Packet,
     ) -> Result<Option<Vec<Packet>>> {
-        let info: MprisInfo = packet.body_as("mpris")?;
+        let mut info: MprisInfo = packet.body_as("mpris")?;
 
         info!(
             device_id = %device_id,
@@ -885,6 +904,7 @@ impl MprisPlugin {
                     .iter()
                     .position(|p| p.player.as_deref() == Some(player_name.as_str()))
                 {
+                    info = list[pos].updated_by(&packet.body);
                     list[pos] = info.clone();
                 } else if list.len() < MAX_PLAYERS_PER_DEVICE {
                     list.push(info.clone());
@@ -2312,6 +2332,37 @@ mod tests {
                 .any(|c| c == "album_art:VLC media player:file:///tmp/art.png"),
             "backend must be consulted with the (player, url) pair; got: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_partial_update_keeps_the_rest_of_the_player() {
+        let plugin = MprisPlugin::new(Arc::new(PluginEventBroadcaster::new(16, "plugin")));
+        let update = |body: serde_json::Value| {
+            plugin.handle_packet("phone", Packet::new("kdeconnect.mpris".into(), body))
+        };
+        update(serde_json::json!({
+            "player": "Player", "title": "Song", "artist": "Artist", "isPlaying": true,
+            "canPlay": true, "canGoNext": true, "pos": 100, "volume": 40.0
+        }))
+        .await
+        .unwrap();
+        update(serde_json::json!({"player": "Player", "pos": 200}))
+            .await
+            .unwrap();
+        update(serde_json::json!({"player": "Player", "volume": 70.0}))
+            .await
+            .unwrap();
+        let player = plugin.get_players("phone").remove(0);
+        assert_eq!(player.title.as_deref(), Some("Song"));
+        assert!(player.is_playing && player.can_play && player.can_go_next);
+        assert_eq!((player.position, player.volume), (Some(200), Some(70.0)));
+        // A field the phone sends explicitly still replaces the old value.
+        update(serde_json::json!({"player": "Player", "artist": null, "isPlaying": false}))
+            .await
+            .unwrap();
+        let player = plugin.get_players("phone").remove(0);
+        assert_eq!(player.artist, None);
+        assert!(!player.is_playing);
     }
 
     #[tokio::test]
