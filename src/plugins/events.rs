@@ -96,10 +96,6 @@ pub enum PluginEvent {
         number_of_files: u32,
         total_payload_size: u64,
     },
-    /// Local sink state refresh from the PulseAudio/PipeWire backend.
-    /// `device_id` is "local" — these are the sinks WE expose, not a
-    /// peer's. Mirrors the broadcast shape of other local-only events
-    /// (clipboard-desktop-update).
     SmsMessagesReceived {
         device_id: String,
         messages: Vec<crate::plugins::sms::SmsMessage>,
@@ -115,6 +111,10 @@ pub enum PluginEvent {
         file_path: String,
         unique_identifier: String,
     },
+    /// Local sink state refresh from the PulseAudio/PipeWire backend.
+    /// `device_id` is "local" — these are the sinks WE expose, not a
+    /// peer's. Mirrors the broadcast shape of other local-only events
+    /// (clipboard-desktop-update).
     SystemVolumeUpdate {
         sinks: Vec<crate::plugins::systemvolume::SinkState>,
     },
