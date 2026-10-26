@@ -934,12 +934,15 @@ impl MprisPlugin {
     /// payload-transfer machinery, the same wire path the share plugin
     /// uses — see `src/protocol/payload_transfer.rs` and the share
     /// handler at `src/api/handlers/share.rs`.
+    ///
+    /// Sends the envelope itself, so a failed send can stop the payload
+    /// listener; nothing is returned for the router to send again.
     async fn handle_album_art_request(
         &self,
         device_id: &str,
         player: &str,
         requested_url: &str,
-    ) -> Option<Vec<Packet>> {
+    ) -> Option<()> {
         let backend = self.backend()?;
         let source = match backend.album_art(player, requested_url).await {
             Some(src) => src,
@@ -1043,8 +1046,7 @@ impl MprisPlugin {
                 }
             }
         });
-
-        Some(vec![packet])
+        Some(())
     }
 
     async fn handle_control_request(
@@ -1071,9 +1073,10 @@ impl MprisPlugin {
         // failure (mpriscontrolplugin.cpp:222,234,239 — the phone's UI keeps
         // its placeholder); we do the same. See module docs for the wire shape.
         if let Some(album_art_url) = body.get("albumArtUrl").and_then(|v| v.as_str()) {
-            return Ok(self
+            let _ = self
                 .handle_album_art_request(device_id, player, album_art_url)
-                .await);
+                .await;
+            return Ok(None);
         }
 
         let known_player = !player.is_empty() && self.core.has_player(player);
@@ -2308,6 +2311,85 @@ mod tests {
                 .iter()
                 .any(|c| c == "album_art:VLC media player:file:///tmp/art.png"),
             "backend must be consulted with the (player, url) pair; got: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_album_art_is_announced_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let certs = Arc::new(crate::protocol::CertificateManager::new(
+            temp.path().join("certs"),
+        ));
+        certs.init().unwrap();
+        certs
+            .ensure_own_certificate("desktopbbbbbbbbbbbbbbbbbbbbbbbbb", "Desktop")
+            .unwrap();
+        let cm = Arc::new(crate::protocol::ConnectionManager::new(certs).unwrap());
+        let phone_certs = Arc::new(crate::protocol::CertificateManager::new(
+            temp.path().join("phone"),
+        ));
+        phone_certs.init().unwrap();
+        phone_certs
+            .ensure_own_certificate("phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Phone")
+            .unwrap();
+        let phone = Arc::new(crate::protocol::ConnectionManager::new(phone_certs).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = phone.clone();
+        let accepting = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            server
+                .accept_test("desktopbbbbbbbbbbbbbbbbbbbbbbbbb".into(), tcp)
+                .await
+                .unwrap();
+        });
+        cm.connect(&"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), addr)
+            .await
+            .unwrap();
+        accepting.await.unwrap();
+        let art = temp.path().join("art.png");
+        std::fs::write(&art, b"image bytes").unwrap();
+        let backend = MockMprisBackend::new().with_art_source(
+            "Player",
+            "file:///art",
+            AlbumArtSource {
+                path: art,
+                size: 11,
+                current_url: "file:///art".into(),
+            },
+        );
+        let plugin = MprisPlugin::new(Arc::new(PluginEventBroadcaster::new(16, "plugin")))
+            .with_connection_manager(cm.clone());
+        plugin.set_backend(backend);
+        let response = plugin
+            .handle_packet(
+                "phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Packet::new(
+                    "kdeconnect.mpris.request".into(),
+                    serde_json::json!({"player": "Player", "albumArtUrl": "file:///art"}),
+                ),
+            )
+            .await
+            .unwrap();
+        // The packet loop sends whatever a handler returns.
+        for packet in response.unwrap_or_default() {
+            cm.send_packet(&"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), &packet)
+                .await
+                .unwrap();
+        }
+        let first = phone
+            .recv_packet(&"desktopbbbbbbbbbbbbbbbbbbbbbbbbb".into())
+            .await
+            .unwrap();
+        assert!(first.body["transferringAlbumArt"].as_bool().unwrap());
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            phone.recv_packet(&"desktopbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "the album-art envelope was announced twice"
         );
     }
 
