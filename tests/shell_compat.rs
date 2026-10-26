@@ -2725,3 +2725,73 @@ async fn a_second_claimant_cannot_take_the_daemons_bus_name() {
     );
     service.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discovered_device_gets_its_dbus_object_without_a_connection() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    // A plugin signal arriving shows the startup resynchronization is over.
+    let client = bus.connect(None).await;
+    let battery = zbus::Proxy::new(
+        &client,
+        "org.kde.kdeconnect",
+        "/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa/battery",
+        "org.kde.kdeconnect.device.battery",
+    )
+    .await
+    .unwrap();
+    let mut ready = battery.receive_signal("refreshed").await.unwrap();
+    app.plugin_events
+        .broadcast(rust_connect::plugins::PluginEvent::Battery {
+            device_id: PHONE.into(),
+            current_charge: 50,
+            is_charging: false,
+        });
+    tokio::time::timeout(Duration::from_secs(3), ready.next())
+        .await
+        .unwrap()
+        .unwrap();
+    // What discovery does for a phone it has not seen before.
+    let newcomer = "newphoneaaaaaaaaaaaaaaaaaaaaaaaa";
+    app.registry
+        .upsert_device(Device::new(
+            newcomer.into(),
+            "New phone".into(),
+            DeviceType::Phone,
+            8,
+        ))
+        .await
+        .unwrap();
+    app.broadcaster
+        .broadcast(rust_connect::device::DeviceEvent::Discovered {
+            device_id: newcomer.into(),
+            device_name: "New phone".into(),
+            device_type: DeviceType::Phone,
+        });
+    let path = format!("/modules/kdeconnect/devices/{newcomer}");
+    let proxy = zbus::Proxy::new(
+        &client,
+        "org.kde.kdeconnect",
+        path.as_str(),
+        "org.kde.kdeconnect.device",
+    )
+    .await
+    .unwrap();
+    let found = tokio::time::timeout(Duration::from_secs(5), async {
+        while proxy.get_property::<String>("name").await.as_deref() != Ok("New phone") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    service.stop().await;
+    assert!(found.is_ok(), "the discovered device has no D-Bus object");
+}

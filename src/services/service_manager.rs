@@ -411,8 +411,20 @@ fn on_device_discovered(state: Arc<AppState>, identity: Identity, addr: std::net
                 device.protocol_version = known.protocol_version;
             }
         }
+        let first_seen = state.registry.get(&device_id).await.is_err();
+        let (name, kind) = (device.name.clone(), device.device_type);
         if let Err(e) = state.registry.upsert_device(device).await {
             warn!(error = %e, device_id = %device_id, event = "device_upsert_failed", "Failed to upsert discovered device");
+        } else if first_seen {
+            // Listeners such as the D-Bus service learn of the device even if
+            // no connection to it follows.
+            state
+                .broadcaster
+                .broadcast(crate::device::DeviceEvent::Discovered {
+                    device_id: device_id.clone(),
+                    device_name: name,
+                    device_type: kind,
+                });
         }
 
         crate::services::connection_orchestrator::spawn_discovered_connection(
@@ -1031,5 +1043,36 @@ mod tests {
         state.shutdown.cancel();
         assert_eq!(stored, 8);
         assert!(!refused, "the real protocol-8 phone would now be refused");
+    }
+
+    async fn discovered(
+        events: &mut tokio::sync::broadcast::Receiver<crate::device::DeviceEvent>,
+    ) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(crate::device::DeviceEvent::Discovered { device_id, .. }) =
+                    events.recv().await
+                {
+                    return device_id;
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn test_a_newly_discovered_device_is_announced_once() {
+        let (state, _temp) = test_state();
+        let mut events = state.broadcaster.subscribe();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        on_device_discovered(state.clone(), peer_identity(addr.port()), addr);
+        assert_eq!(discovered(&mut events).await.as_deref(), Some(PEER_ID));
+        // Announcing again is not news.
+        on_device_discovered(state.clone(), peer_identity(addr.port()), addr);
+        assert_eq!(discovered(&mut events).await, None);
+        state.shutdown.cancel();
     }
 }
