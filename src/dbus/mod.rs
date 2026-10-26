@@ -48,8 +48,6 @@ pub(crate) struct Context {
     contact_revisions: Mutex<HashMap<String, u64>>,
     watched_threads: Mutex<HashSet<(String, i64)>>,
     known_threads: Mutex<HashMap<String, HashSet<i64>>>,
-    /// When each device last sent messages, until `settle_threads` checks it.
-    thread_syncs: Mutex<HashMap<String, recovery::ThreadSync>>,
     /// When each reconnected device last sent a notification, until
     /// `settle_notifications` drops the ones it no longer has.
     notification_syncs: Mutex<HashMap<String, std::time::Instant>>,
@@ -430,8 +428,6 @@ impl Context {
             | DeviceEvent::Removed { device_id } => device_id,
         };
         if disconnected {
-            // A reconnect starts its conversation sync afresh.
-            self.thread_syncs.lock().await.remove(&device);
             let info = crate::plugins::telephony::TelephonyInfo {
                 event: "ringing".into(),
                 phone_number: None,
@@ -602,7 +598,6 @@ impl Context {
             .await
             .retain(|(id, _)| id != device);
         self.known_threads.lock().await.remove(device);
-        self.thread_syncs.lock().await.remove(device);
         self.call_revisions.lock().await.remove(device);
         self.attachment_revisions
             .lock()
@@ -740,7 +735,6 @@ impl DBusService {
             contact_revisions: Mutex::new(HashMap::new()),
             watched_threads: Mutex::new(HashSet::new()),
             known_threads: Mutex::new(HashMap::new()),
-            thread_syncs: Mutex::new(HashMap::new()),
             notification_syncs: Mutex::new(HashMap::new()),
             call_revisions: Mutex::new(HashMap::new()),
             attachment_revisions: Mutex::new(HashMap::new()),
@@ -825,7 +819,6 @@ impl DBusService {
                             None => std::future::pending().await,
                         }
                     } => {
-                        if let Err(error)=context.settle_threads().await {tracing::warn!(%error,"Conversation removal check failed");}
                         context.settle_notifications().await
                     },
                 };

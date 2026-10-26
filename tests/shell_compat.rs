@@ -2077,8 +2077,20 @@ async fn a_reconnect_burst_does_not_report_conversations_as_removed() {
         .await
         .unwrap()
         .unwrap();
+    // A new text in the one thread back so far is no sign the others are gone.
+    app.plugins
+        .sms
+        .handle_packet(
+            PHONE,
+            Packet::new(
+                "kdeconnect.sms.messages".into(),
+                serde_json::json!({"messages":[{"thread_id":2,"_id":200,"date":500,"body":"live"}]}),
+            ),
+        )
+        .await
+        .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), removed.next())
+        tokio::time::timeout(Duration::from_secs(2), removed.next())
             .await
             .is_err(),
         "threads that have not arrived again yet must not be reported removed"
