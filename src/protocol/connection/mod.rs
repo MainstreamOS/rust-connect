@@ -44,7 +44,10 @@ pub struct ConnectionManager {
     /// recovers the peer, which is the case vk #1101 exists to fix.
     pub(crate) last_mdns_unicast: Arc<RwLock<HashMap<String, Instant>>>,
     pub pending_connections: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
-    pub(crate) reconnecting_devices: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
+    /// The address each running reconnect loop dials, with a count of how
+    /// often a later call has moved it (see `connection_orchestrator::reconnect_loop`).
+    pub(crate) reconnecting_devices:
+        Arc<std::sync::Mutex<HashMap<DeviceId, (std::net::SocketAddr, u64)>>>,
     /// Where each dropped phone is asked to dial back, with a count of how often
     /// a new drop has updated it (see `connection_orchestrator::spawn_dial_back_requests`).
     pub(crate) dial_back_targets: Arc<std::sync::Mutex<HashMap<DeviceId, (std::net::IpAddr, u64)>>>,
@@ -234,7 +237,7 @@ impl ConnectionManager {
             last_connection_attempt: Arc::new(RwLock::new(HashMap::new())),
             last_mdns_unicast: Arc::new(RwLock::new(HashMap::new())),
             pending_connections: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            reconnecting_devices: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            reconnecting_devices: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dial_back_targets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cert_manager,
             device_id: Arc::new(std::sync::RwLock::new(String::new())),

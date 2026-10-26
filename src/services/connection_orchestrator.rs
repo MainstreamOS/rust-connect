@@ -155,6 +155,21 @@ impl Drop for PendingGuard {
     }
 }
 
+/// Ends a phone's reconnect loop registration on every exit path.
+struct ReconnectGuard {
+    targets: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (SocketAddr, u64)>>>,
+    id: String,
+}
+
+impl Drop for ReconnectGuard {
+    fn drop(&mut self) {
+        self.targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
 /// Reconnect paired devices with exponential backoff, including after the
 /// initial burst of retries. Only one retry loop per device may stay alive.
 async fn reconnect_loop(
@@ -163,23 +178,38 @@ async fn reconnect_loop(
     addr: SocketAddr,
     device_id: String,
 ) {
-    let pending = state.connection_manager.reconnecting_devices.clone();
-    if !pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(device_id.clone())
+    let targets = state.connection_manager.reconnecting_devices.clone();
     {
-        return;
+        let mut running = targets.lock().unwrap_or_else(|e| e.into_inner());
+        // One loop per phone; a later call only moves it to the newest address.
+        if let Some(target) = running.get_mut(&device_id) {
+            if target.0 != addr {
+                *target = (addr, target.1 + 1);
+            }
+            return;
+        }
+        running.insert(device_id.clone(), (addr, 0));
     }
-    let _reconnect_guard = PendingGuard {
-        pending,
+    let _reconnect_guard = ReconnectGuard {
+        targets: targets.clone(),
         id: device_id.clone(),
     };
+    let mut addr = addr;
+    let mut seen = 0u64;
     let mut attempt = 0u32;
 
     loop {
         if state.shutdown.is_cancelled() {
             return;
+        }
+        if let Some(&(latest, generation)) = targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&device_id)
+        {
+            if generation != seen {
+                (addr, seen, attempt) = (latest, generation, 0);
+            }
         }
         attempt = attempt.saturating_add(1);
         if attempt > 5 && !state.pairing_handler.is_paired(&device_id).await {
@@ -804,6 +834,35 @@ mod tests {
             .lock()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_later_reconnect_moves_the_running_loop_to_the_new_address() {
+        let (state, _t) = test_state();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            reconnect_loop(
+                first_state,
+                peer_identity(),
+                "127.0.0.1:1".parse().unwrap(),
+                PEER_ID.to_string(),
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        let moved: SocketAddr = "127.0.0.2:1".parse().unwrap();
+        reconnect_loop(state.clone(), peer_identity(), moved, PEER_ID.to_string()).await;
+        assert_eq!(
+            state
+                .connection_manager
+                .reconnecting_devices
+                .lock()
+                .unwrap()
+                .get(PEER_ID),
+            Some(&(moved, 1))
+        );
+        state.shutdown.cancel();
+        first.await.unwrap();
     }
 
     async fn pair_peer(state: &Arc<AppState>) {
