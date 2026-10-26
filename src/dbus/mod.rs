@@ -691,14 +691,33 @@ pub struct DBusService {
 }
 impl DBusService {
     pub async fn start(app: Arc<AppState>, shutdown: CancellationToken) -> zbus::Result<Self> {
-        let bus = zbus::connection::Builder::session()?
-            .name(SERVICE)?
-            .build()
-            .await?;
         let contacts = dirs::data_dir()
             .unwrap_or_else(|| app.settings.data_dir.clone())
             .join("kpeoplevcard");
-        Self::on_connection(app, bus, contacts, shutdown).await
+        Self::claim(
+            app,
+            zbus::connection::Builder::session()?,
+            contacts,
+            shutdown,
+        )
+        .await
+    }
+    /// Takes the KDE Connect name on `bus` and serves it. zbus would otherwise
+    /// let any later claimant, such as a second instance or a test, take the
+    /// name from the running daemon for good.
+    pub async fn claim(
+        app: Arc<AppState>,
+        bus: zbus::connection::Builder<'_>,
+        contacts_root: PathBuf,
+        shutdown: CancellationToken,
+    ) -> zbus::Result<Self> {
+        let bus = bus
+            .name(SERVICE)?
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
+            .build()
+            .await?;
+        Self::on_connection(app, bus, contacts_root, shutdown).await
     }
     /// Also used by the private-bus integration harness, with isolated storage.
     pub async fn on_connection(

@@ -68,11 +68,16 @@ pub async fn start_services(
     let tcp = start_tcp_listener(&state, tcp_listener, identity.clone(), shutdown.clone());
     let api = start_api_server(&state, shutdown.clone()).await?;
 
-    let dbus = match crate::dbus::DBusService::start(state.clone(), shutdown.clone()).await {
-        Ok(service) => Some(service),
-        Err(error) => {
-            warn!(%error,"Desktop phone integration unavailable on session D-Bus");
-            None
+    // Unit tests run on the desktop's own session bus, where the real daemon lives.
+    let dbus = if cfg!(test) {
+        None
+    } else {
+        match crate::dbus::DBusService::start(state.clone(), shutdown.clone()).await {
+            Ok(service) => Some(service),
+            Err(error) => {
+                warn!(%error,"Desktop phone integration unavailable on session D-Bus");
+                None
+            }
         }
     };
     info!(event = "daemon_ready", "Daemon ready - all systems active");

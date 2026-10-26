@@ -2675,3 +2675,41 @@ async fn the_event_stream_accepts_a_percent_encoded_api_key() {
         axum::http::StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_claimant_cannot_take_the_daemons_bus_name() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let service = DBusService::claim(
+        app.clone(),
+        zbus::connection::Builder::address(bus.address.as_str()).unwrap(),
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let other = bus.connect(None).await;
+    use zbus::fdo::RequestNameFlags;
+    let taken = other
+        .request_name_with_flags(
+            "org.kde.kdeconnect",
+            RequestNameFlags::ReplaceExisting | RequestNameFlags::DoNotQueue,
+        )
+        .await;
+    assert!(
+        !matches!(taken, Ok(zbus::fdo::RequestNameReply::PrimaryOwner)),
+        "another connection took the daemon's name: {taken:?}"
+    );
+    let owner = zbus::fdo::DBusProxy::new(&other)
+        .await
+        .unwrap()
+        .get_name_owner("org.kde.kdeconnect".try_into().unwrap())
+        .await
+        .unwrap();
+    assert_ne!(
+        Some(owner.as_str()),
+        other.unique_name().map(|n| n.as_str())
+    );
+    service.stop().await;
+}
