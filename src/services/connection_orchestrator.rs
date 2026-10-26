@@ -59,6 +59,7 @@ async fn run_connection_setup(
         .lifecycle
         .ensure_and_transition(connected_id, remote_identity, DeviceState::Connected)
         .await;
+    state.connection_manager.release(connected_id);
 
     // If a pair request is queued (INITIATE call from the API that landed
     // while the link was down — handlers/device.rs:245-258 silently drops
@@ -199,7 +200,7 @@ async fn reconnect_loop(
     let mut attempt = 0u32;
 
     loop {
-        if state.shutdown.is_cancelled() {
+        if state.shutdown.is_cancelled() || state.connection_manager.is_held(&device_id) {
             return;
         }
         if let Some(&(latest, generation)) = targets
@@ -237,7 +238,10 @@ async fn reconnect_loop(
             _ = state.shutdown.cancelled() => return,
         }
 
-        if state.shutdown.is_cancelled() || state.connection_manager.is_connected(&device_id).await
+        // The user may have disconnected the phone during the wait.
+        if state.shutdown.is_cancelled()
+            || state.connection_manager.is_held(&device_id)
+            || state.connection_manager.is_connected(&device_id).await
         {
             return;
         }
@@ -392,6 +396,7 @@ async fn request_dial_back_loop(state: Arc<AppState>, device_id: String, udp_por
         }
         if state.shutdown.is_cancelled()
             || state.connection_manager.is_connected(&device_id).await
+            || state.connection_manager.is_held(&device_id)
             || !state.pairing_handler.is_paired(&device_id).await
         {
             let mut current = targets.lock().unwrap_or_else(|e| e.into_inner());
@@ -455,7 +460,9 @@ pub fn spawn_discovered_connection(state: Arc<AppState>, identity: Identity, add
     let connect_addr = SocketAddr::new(addr.ip(), tcp_port);
 
     tokio::spawn(async move {
-        if state.connection_manager.is_connected(&device_id).await {
+        if state.connection_manager.is_connected(&device_id).await
+            || state.connection_manager.is_held(&device_id)
+        {
             return;
         }
 
@@ -863,6 +870,72 @@ mod tests {
         );
         state.shutdown.cancel();
         first.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_phone_the_user_disconnected_is_not_redialed() {
+        let (state, _t) = test_state();
+        state.connection_manager.hold(&PEER_ID.to_string());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reconnect_loop(
+                state.clone(),
+                peer_identity(),
+                "127.0.0.1:1".parse().unwrap(),
+                PEER_ID.to_string(),
+            ),
+        )
+        .await
+        .expect("a held phone ends its reconnect loop");
+        assert!(state
+            .connection_manager
+            .reconnecting_devices
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_discovery_does_not_dial_a_phone_the_user_disconnected() {
+        let (state, _t) = test_state();
+        pair_peer(&state).await;
+        state.connection_manager.hold(&PEER_ID.to_string());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut identity = peer_identity();
+        identity.tcp_port = Some(addr.port());
+        spawn_discovered_connection(state.clone(), identity, addr);
+        let dial =
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
+        state.shutdown.cancel();
+        assert!(
+            dial.is_err(),
+            "discovery dialed a phone the user disconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_disconnect_during_the_reconnect_wait_stops_the_next_dial() {
+        let (state, _t) = test_state();
+        pair_peer(&state).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(reconnect_loop(
+            state.clone(),
+            peer_identity(),
+            addr,
+            PEER_ID.to_string(),
+        ));
+        // The first backoff lasts at least a second; hold once it has begun.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.connection_manager.hold(&PEER_ID.to_string());
+        let dial = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await;
+        state.shutdown.cancel();
+        task.abort();
+        assert!(
+            dial.is_err(),
+            "a hold set during the wait was not checked before dialing"
+        );
     }
 
     async fn pair_peer(state: &Arc<AppState>) {

@@ -48,6 +48,9 @@ pub struct ConnectionManager {
     /// often a later call has moved it (see `connection_orchestrator::reconnect_loop`).
     pub(crate) reconnecting_devices:
         Arc<std::sync::Mutex<HashMap<DeviceId, (std::net::SocketAddr, u64)>>>,
+    /// Phones the user disconnected. Automatic redials leave them alone until
+    /// they connect again.
+    held_devices: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
     /// Where each dropped phone is asked to dial back, with a count of how often
     /// a new drop has updated it (see `connection_orchestrator::spawn_dial_back_requests`).
     pub(crate) dial_back_targets: Arc<std::sync::Mutex<HashMap<DeviceId, (std::net::IpAddr, u64)>>>,
@@ -238,6 +241,7 @@ impl ConnectionManager {
             last_mdns_unicast: Arc::new(RwLock::new(HashMap::new())),
             pending_connections: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             reconnecting_devices: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            held_devices: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             dial_back_targets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cert_manager,
             device_id: Arc::new(std::sync::RwLock::new(String::new())),
@@ -864,6 +868,29 @@ impl ConnectionManager {
     /// generation has replaced it. On `false` the replacement owns the map
     /// slot, the cancel-token slot, and the lifecycle/plugin state, and the
     /// caller must not touch any of them.
+    /// Mark a phone the user disconnected, so redials leave it alone.
+    pub fn hold(&self, device_id: &DeviceId) {
+        self.held_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device_id.clone());
+    }
+
+    /// Clear the user's disconnect once the phone is connected again.
+    pub fn release(&self, device_id: &DeviceId) {
+        self.held_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id);
+    }
+
+    pub fn is_held(&self, device_id: &DeviceId) -> bool {
+        self.held_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(device_id)
+    }
+
     pub async fn disconnect(&self, device_id: &DeviceId, generation: u64) -> Result<bool> {
         let mut connections = self.connections.write().await;
         if let Some(handle) = connections.get(device_id) {

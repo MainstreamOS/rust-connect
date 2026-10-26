@@ -241,6 +241,7 @@ impl TcpListenerService {
                 {
                     warn!(device_id = %device_id, error = %e, event = "connected_transition_failed", "Failed to transition device to Connected");
                 }
+                cm.release(&device_id);
 
                 if pairing.is_paired(&device_id).await {
                     trace!(device_id = %device_id, event = "notifying_plugins", "Device already paired, sending plugin init packets");
@@ -277,6 +278,7 @@ impl TcpListenerService {
 
                 if matches!(loop_result, LoopResult::Disconnected)
                     && state.pairing_handler.is_paired(&device_id).await
+                    && !cm.is_held(&device_id)
                     && !state.shutdown.is_cancelled()
                 {
                     info!(

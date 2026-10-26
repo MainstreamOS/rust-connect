@@ -547,6 +547,7 @@ pub async fn disconnect_device(
     }
 
     let generation = state.connection_manager.get_generation(&device_id).await;
+    state.connection_manager.hold(&device_id);
 
     if let Some(gen) = generation {
         // Teardown only when the disconnect actually owned the link: a
