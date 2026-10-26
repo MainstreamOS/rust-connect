@@ -53,6 +53,9 @@ const MAX_CONTACTS_PER_DEVICE: usize = 10_000;
 /// hold ~6 KiB per vCard on average, well above any real contact.
 const MAX_VCARD_BYTES_PER_DEVICE: usize = 64 * 1024 * 1024;
 
+/// How long cards the phone has not answered may keep the mirror waiting.
+const PENDING_VCARDS_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A contact stored from a phone-provided vCard.
 ///
 /// `name`, `phone_numbers` and `emails` are parsed minimally (dependency-free)
@@ -84,6 +87,9 @@ struct DeviceContacts {
     timestamps: HashMap<String, String>,
     /// Changed/new cards still outstanding in the current snapshot.
     pending: HashSet<String>,
+    /// When cards were first left outstanding. A card the phone never sends
+    /// stops holding the mirror back after `PENDING_VCARDS_WAIT`.
+    pending_since: Option<std::time::Instant>,
     /// uid -> stored contact
     contacts: HashMap<String, Contact>,
     /// Sum of `Contact::vcard.len()` over `contacts` (the byte-counting
@@ -141,8 +147,11 @@ impl ContactsPlugin {
     ) -> Option<(u64, Vec<Contact>)> {
         let devices = self.devices.read().unwrap_or_else(|e| e.into_inner());
         let state = devices.get(device)?;
-        if !state.snapshot_received || !state.pending.is_empty() || revision == Some(state.revision)
-        {
+        let waiting = !state.pending.is_empty()
+            && state
+                .pending_since
+                .is_some_and(|since| since.elapsed() < PENDING_VCARDS_WAIT);
+        if !state.snapshot_received || waiting || revision == Some(state.revision) {
             return None;
         }
         Some((state.revision, state.contacts.values().cloned().collect()))
@@ -407,7 +416,13 @@ impl Plugin for ContactsPlugin {
                         state.revision = self.revision.fetch_add(1, Ordering::Relaxed);
                     }
                     state.snapshot_received = true;
-                    state.pending = to_fetch.iter().cloned().collect();
+                    let pending: HashSet<String> = to_fetch.iter().cloned().collect();
+                    if pending.is_empty() {
+                        state.pending_since = None;
+                    } else if state.pending_since.is_none() || !pending.is_subset(&state.pending) {
+                        state.pending_since = Some(std::time::Instant::now());
+                    }
+                    state.pending = pending;
                     state.timestamps = reported;
                     state.contacts.retain(|uid, _| reported_uids.contains(uid));
                     state.total_vcard_bytes = state.contacts.values().map(|c| c.vcard.len()).sum();
@@ -441,6 +456,11 @@ impl Plugin for ContactsPlugin {
                     return Ok(None);
                 };
 
+                let answered: Vec<String> = uids
+                    .iter()
+                    .filter_map(|u| u.as_str())
+                    .map(str::to_string)
+                    .collect();
                 let mut parsed = Vec::new();
                 for uid in uids.iter().filter_map(|u| u.as_str()) {
                     let Some(vcard) = packet.body.get(uid).and_then(|v| v.as_str()) else {
@@ -468,6 +488,10 @@ impl Plugin for ContactsPlugin {
                 let reported: HashSet<String> = state.timestamps.keys().cloned().collect();
                 let (stored, dropped_unreported, dropped_cap) =
                     Self::store_vcards(state, &reported, parsed);
+                // An answered card no longer holds the mirror back, stored or not.
+                for uid in &answered {
+                    state.pending.remove(uid);
+                }
                 if stored > 0 {
                     state.revision = self.revision.fetch_add(1, Ordering::Relaxed);
                 }
@@ -718,6 +742,30 @@ mod tests {
         requested.sort();
         assert_eq!(requested, vec!["2", "3"]);
         assert!(plugin.synchronized_contacts("d").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cards_the_phone_cannot_send_stop_holding_the_mirror_back() {
+        let plugin = ContactsPlugin::new();
+        let snapshot = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1", "2", "3"], "1": "100", "2": "200", "3": "300" }),
+        );
+        plugin.handle_packet("d", snapshot).await.unwrap();
+        // Card 2 is answered without a body; card 3 is left out entirely.
+        let cards = Packet::new(
+            "kdeconnect.contacts.response_vcards".to_string(),
+            serde_json::json!({ "uids": ["1", "2"], "1": "BEGIN:VCARD\nFN:Alice\nEND:VCARD" }),
+        );
+        plugin.handle_packet("d", cards).await.unwrap();
+        assert!(plugin.synchronized_contacts("d").is_none());
+        {
+            let mut devices = plugin.devices.write().unwrap();
+            let state = devices.get_mut("d").unwrap();
+            assert_eq!(state.pending, HashSet::from(["3".to_string()]));
+            state.pending_since = Some(std::time::Instant::now() - PENDING_VCARDS_WAIT);
+        }
+        assert_eq!(plugin.synchronized_contacts("d").unwrap().len(), 1);
     }
 
     #[tokio::test]
