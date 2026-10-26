@@ -2633,3 +2633,45 @@ async fn huge_page_numbers_return_an_empty_page() {
         assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
     }
 }
+
+#[tokio::test]
+async fn the_event_stream_accepts_a_percent_encoded_api_key() {
+    use tower::ServiceExt;
+    let temp = tempfile::tempdir().unwrap();
+    let app = Arc::new(
+        AppState::new_without_input(
+            AppSettings::new_with_data_dir(temp.path().into())
+                .with_api_keys(vec!["review/key+value=".into()]),
+        )
+        .unwrap(),
+    );
+    let status = |uri: &'static str| {
+        let router = rust_connect::api::build_router(app.clone());
+        async move {
+            router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    // As encodeURIComponent writes the key.
+    assert_eq!(
+        status("/api/v1/events?api_key=review%2Fkey%2Bvalue%3D").await,
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(
+        status("/api/v1/events?api_key=%zz").await,
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+    // The query form stays limited to the event stream.
+    assert_eq!(
+        status("/api/v1/devices?api_key=review%2Fkey%2Bvalue%3D").await,
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+}

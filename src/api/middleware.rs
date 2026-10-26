@@ -150,17 +150,12 @@ pub async fn auth_middleware(
     if let Some(key) = req.headers().get("X-API-Key").and_then(|h| h.to_str().ok()) {
         api_key = Some(key.to_string());
     } else if allow_query {
-        if let Some(query) = req.uri().query() {
-            for param in query.split('&') {
-                let mut parts = param.splitn(2, '=');
-                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                    if k == "api_key" {
-                        api_key = Some(v.to_string());
-                        break;
-                    }
-                }
-            }
-        }
+        // Decoded: the web UI percent-encodes the key for EventSource.
+        api_key = axum::extract::Query::<std::collections::HashMap<String, String>>::try_from_uri(
+            req.uri(),
+        )
+        .ok()
+        .and_then(|query| query.0.get("api_key").cloned());
     }
 
     let is_valid = if let Some(key) = api_key {
