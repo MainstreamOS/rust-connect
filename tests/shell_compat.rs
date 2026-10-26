@@ -2496,3 +2496,117 @@ async fn desktop_clipboard_never_reaches_a_phone_that_is_not_paired() {
         "an unpaired peer received the desktop clipboard: {received:?}"
     );
 }
+
+#[tokio::test]
+async fn a_pairing_kept_only_as_its_certificate_stays_trusted_and_pinned() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    // The phone's certificate as some installs keep it, with no fingerprint.
+    let phone_dir = tempfile::tempdir().unwrap();
+    let phone = rust_connect::protocol::CertificateManager::new(phone_dir.path().into());
+    phone.init().unwrap();
+    phone.ensure_own_certificate(PHONE, "Phone").unwrap();
+    std::fs::copy(
+        phone_dir.path().join("own.crt"),
+        app.settings.cert_dir.join(format!("{PHONE}_peer.crt")),
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("paired.json"),
+        serde_json::to_vec(&serde_json::json!({ PHONE: chrono::Utc::now() })).unwrap(),
+    )
+    .unwrap();
+    app.pairing_handler.load_from_disk().await.unwrap();
+    assert!(app.pairing_handler.is_paired(&PHONE.into()).await);
+    assert!(app.cert_manager.has_peer_fingerprint(PHONE));
+}
+
+#[tokio::test]
+async fn a_paired_phone_without_its_certificate_pin_is_not_trusted() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    // As left by an unpair cut short or a partial restore.
+    std::fs::write(
+        temp.path().join("paired.json"),
+        serde_json::to_vec(&serde_json::json!({ PHONE: chrono::Utc::now() })).unwrap(),
+    )
+    .unwrap();
+    app.pairing_handler.load_from_disk().await.unwrap();
+    assert!(!app.cert_manager.has_peer_fingerprint(PHONE));
+    assert!(!app.pairing_handler.is_paired(&PHONE.into()).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_pin_does_not_let_another_certificate_act_as_the_paired_phone() {
+    use rust_connect::protocol::{CertificateManager, ConnectionManager, Identity};
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    app.cert_manager
+        .ensure_own_certificate(DESKTOP, "Desktop")
+        .unwrap();
+    app.connection_manager
+        .set_device_identity(DESKTOP, "Desktop");
+    let stale = HashMap::from([(PHONE, chrono::Utc::now())]);
+    std::fs::write(
+        temp.path().join("paired.json"),
+        serde_json::to_vec(&stale).unwrap(),
+    )
+    .unwrap();
+    app.pairing_handler.load_from_disk().await.unwrap();
+    let local = Identity::new(
+        DESKTOP.into(),
+        "Desktop".into(),
+        DeviceType::Desktop,
+        vec!["kdeconnect.clipboard".into()],
+        vec![],
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stop = cancel.clone();
+    let service = rust_connect::protocol::listener::TcpListenerService::new(app.clone(), local);
+    let task = tokio::spawn(async move { service.run_from_bound(listener, stop).await.unwrap() });
+    let other_dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(CertificateManager::new(other_dir.path().into()));
+    certs.init().unwrap();
+    certs
+        .ensure_own_certificate(PHONE, "Different key")
+        .unwrap();
+    let other = ConnectionManager::new(certs).unwrap();
+    other.set_device_identity(PHONE, "Different key");
+    let identity = Identity::new(
+        PHONE.into(),
+        "Different key".into(),
+        DeviceType::Phone,
+        vec![],
+        vec!["kdeconnect.clipboard".into()],
+    );
+    other
+        .connect_to_device(&identity, addr, None)
+        .await
+        .unwrap();
+    other
+        .send_packet(
+            &DESKTOP.into(),
+            &Packet::new(
+                "kdeconnect.clipboard".into(),
+                serde_json::json!({"content": "from a different certificate"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let injected = tokio::time::timeout(Duration::from_secs(2), async {
+        while app.plugins.clipboard.get_content().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    cancel.cancel();
+    app.shutdown.cancel();
+    task.await.unwrap();
+    assert!(
+        !injected,
+        "a never-approved certificate was treated as the paired phone"
+    );
+}

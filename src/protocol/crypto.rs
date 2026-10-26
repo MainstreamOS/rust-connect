@@ -791,6 +791,21 @@ impl CertificateManager {
         self.fingerprint_path(device_id).is_ok_and(|p| p.exists())
     }
 
+    /// Whether a paired device is pinned, rebuilding the fingerprint from its
+    /// stored certificate when only the certificate is on disk, as on some
+    /// installs. Without either, nothing ties the device id to a key.
+    pub fn ensure_peer_fingerprint(&self, device_id: &str) -> bool {
+        if self.has_peer_fingerprint(device_id) {
+            return true;
+        }
+        let rebuilt = self
+            .load_peer_certificate_pem(device_id)
+            .and_then(|pem| pem_to_der(&pem))
+            .and_then(|der| Self::compute_fingerprint(&der))
+            .and_then(|fingerprint| self.store_peer_fingerprint(device_id, &fingerprint));
+        rebuilt.is_ok()
+    }
+
     pub fn store_peer_fingerprint(&self, device_id: &str, fingerprint: &str) -> Result<()> {
         self.init()?;
         let path = self.fingerprint_path(device_id)?;

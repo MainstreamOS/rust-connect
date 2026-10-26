@@ -705,6 +705,11 @@ impl PairingHandler {
         };
 
         if removed {
+            // Saved before the pin is deleted: stopping in between must leave
+            // a stale pin, never a trusted device without one.
+            if let Err(e) = self.save_to_disk().await {
+                warn!(error = %e, device_id = %device_id, event = "save_after_unpair_failed", "Failed to save pairing state after unpair");
+            }
             let _ = self.cert_manager.delete_certificate(device_id);
             let _ = self.cert_manager.delete_peer_certificate(device_id);
             if let Some(forget) = self.revocation.get() {
@@ -715,9 +720,6 @@ impl PairingHandler {
                 event = "device_unpaired",
                 "Device unpaired"
             );
-            if let Err(e) = self.save_to_disk().await {
-                warn!(error = %e, device_id = %device_id, event = "save_after_unpair_failed", "Failed to save pairing state after unpair");
-            }
 
             // Pairing-event broadcast (Task #1042 fix lane E —
             // pairing-event seam, symmetric to Paired). A
@@ -1025,11 +1027,33 @@ impl PairingHandler {
                 )
             })?;
 
-        let mut paired = self.paired.write().await;
-        paired.extend(loaded);
+        // Trust needs the pinned certificate. Without it, as after an unpair
+        // cut short or a partial restore, TLS would accept any certificate
+        // claiming the id as the paired phone.
+        let (pinned, unpinned): (HashMap<_, _>, HashMap<_, _>) = loaded
+            .into_iter()
+            .partition(|(id, _)| self.cert_manager.ensure_peer_fingerprint(id));
+        for id in unpinned.keys() {
+            warn!(
+                device_id = %id,
+                event = "paired_device_without_pin_dropped",
+                "Dropping a paired device whose certificate pin is missing; pair it again"
+            );
+        }
+
+        let count = {
+            let mut paired = self.paired.write().await;
+            paired.extend(pinned);
+            paired.len()
+        };
+        if !unpinned.is_empty() {
+            if let Err(e) = self.save_to_disk().await {
+                warn!(error = %e, event = "save_after_unpinned_drop_failed", "Failed to save pairing state");
+            }
+        }
 
         info!(
-            device_count = paired.len(),
+            device_count = count,
             path = %path.display(),
             "Loaded paired devices from disk"
         );
