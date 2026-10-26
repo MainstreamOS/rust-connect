@@ -436,6 +436,37 @@ async fn request_dial_back_loop(state: Arc<AppState>, device_id: String, udp_por
 
 /// Spawns a connection task for a discovered device.
 /// Includes a 2-second delay to avoid connecting to devices that are already connecting.
+/// Android isProtocolDowngrade (LanLinkProvider.java:280-283, 351-354): a
+/// trusted device re-announcing a LOWER protocolVersion than we last knew is
+/// refused, never dialed.
+pub(crate) async fn is_protocol_downgrade(
+    state: &AppState,
+    device_id: &str,
+    announced: u32,
+) -> bool {
+    if !state
+        .pairing_handler
+        .is_paired(&device_id.to_string())
+        .await
+    {
+        return false;
+    }
+    let Ok(known) = state.registry.get(&device_id.to_string()).await else {
+        return false;
+    };
+    if known.protocol_version <= announced {
+        return false;
+    }
+    info!(
+        device_id = %device_id,
+        stored_version = known.protocol_version,
+        announced_version = announced,
+        event = "protocol_downgrade_refused",
+        "Refusing to connect to a paired device using an older protocol version"
+    );
+    true
+}
+
 pub fn spawn_discovered_connection(state: Arc<AppState>, identity: Identity, addr: SocketAddr) {
     let device_id = identity.device_id.clone();
 
@@ -466,22 +497,8 @@ pub fn spawn_discovered_connection(state: Arc<AppState>, identity: Identity, add
             return;
         }
 
-        // Android isProtocolDowngrade (LanLinkProvider.java:280-283,
-        // 351-354): a trusted device re-announcing a LOWER protocolVersion
-        // than we last knew is refused — never dial it.
-        if state.pairing_handler.is_paired(&device_id).await {
-            if let Ok(known) = state.registry.get(&device_id).await {
-                if known.protocol_version > identity.protocol_version {
-                    info!(
-                        device_id = %device_id,
-                        stored_version = known.protocol_version,
-                        announced_version = identity.protocol_version,
-                        event = "protocol_downgrade_refused",
-                        "Refusing to connect to a paired device using an older protocol version"
-                    );
-                    return;
-                }
-            }
+        if is_protocol_downgrade(&state, &device_id, identity.protocol_version).await {
+            return;
         }
 
         // Identity check BEFORE adding to the pending set — an early return

@@ -375,7 +375,7 @@ fn on_device_discovered(state: Arc<AppState>, identity: Identity, addr: std::net
         "Discovered device on network"
     );
 
-    let device = Device::new(
+    let mut device = Device::new(
         device_id.clone(),
         device_name,
         device_type,
@@ -387,6 +387,25 @@ fn on_device_discovered(state: Arc<AppState>, identity: Identity, addr: std::net
     );
 
     tokio::spawn(async move {
+        // Checked before the announcement is recorded, which would overwrite
+        // the version it is checked against.
+        if crate::services::connection_orchestrator::is_protocol_downgrade(
+            &state,
+            &device_id,
+            identity.protocol_version,
+        )
+        .await
+        {
+            return;
+        }
+        // A paired phone's version is the floor the downgrade check trusts, so
+        // only its authenticated identity exchange may move it, never an
+        // announcement anyone on the network can send.
+        if state.pairing_handler.is_paired(&device_id).await {
+            if let Ok(known) = state.registry.get(&device_id).await {
+                device.protocol_version = known.protocol_version;
+            }
+        }
         if let Err(e) = state.registry.upsert_device(device).await {
             warn!(error = %e, device_id = %device_id, event = "device_upsert_failed", "Failed to upsert discovered device");
         }
@@ -901,5 +920,111 @@ mod tests {
                 .is_some(),
             "a different address must not inherit the first address's window"
         );
+    }
+
+    #[tokio::test]
+    async fn test_discovery_keeps_refusing_a_paired_phones_older_protocol() {
+        let (state, _temp) = test_state();
+        let (pem, _) = state
+            .cert_manager
+            .generate_certificate(PEER_ID, "Peer")
+            .unwrap();
+        let der = openssl::x509::X509::from_pem(&pem)
+            .unwrap()
+            .to_der()
+            .unwrap();
+        state
+            .pairing_handler
+            .set_pending_peer_cert(&PEER_ID.into(), der)
+            .await;
+        state
+            .pairing_handler
+            .force_accept_pairing(&PEER_ID.into())
+            .await
+            .unwrap();
+        state
+            .registry
+            .add(Device::new(
+                PEER_ID.into(),
+                "Peer".into(),
+                DeviceType::Phone,
+                8,
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut older = peer_identity(addr.port());
+        older.protocol_version = 7;
+        on_device_discovered(state.clone(), older, addr);
+        let dial =
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
+        state.shutdown.cancel();
+        assert!(
+            dial.is_err(),
+            "a paired phone announcing an older protocol was dialed"
+        );
+        assert_eq!(
+            state
+                .registry
+                .get(&PEER_ID.into())
+                .await
+                .unwrap()
+                .protocol_version,
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_announcement_cannot_raise_a_paired_phones_trusted_version() {
+        let (state, _temp) = test_state();
+        let (pem, _) = state
+            .cert_manager
+            .generate_certificate(PEER_ID, "Peer")
+            .unwrap();
+        let der = openssl::x509::X509::from_pem(&pem)
+            .unwrap()
+            .to_der()
+            .unwrap();
+        state
+            .pairing_handler
+            .set_pending_peer_cert(&PEER_ID.into(), der)
+            .await;
+        state
+            .pairing_handler
+            .force_accept_pairing(&PEER_ID.into())
+            .await
+            .unwrap();
+        state
+            .registry
+            .add(Device::new(
+                PEER_ID.into(),
+                "Phone".into(),
+                DeviceType::Phone,
+                8,
+            ))
+            .await
+            .unwrap();
+        // Connected, so discovery records the announcement without dialing it.
+        state
+            .connection_manager
+            .mark_generation_for_test(PEER_ID, 1);
+        let mut forged = peer_identity(1716);
+        forged.protocol_version = 9;
+        on_device_discovered(state.clone(), forged, "127.0.0.2:1716".parse().unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.connection_manager.unmark_generation_for_test(PEER_ID);
+        let stored = state
+            .registry
+            .get(&PEER_ID.into())
+            .await
+            .unwrap()
+            .protocol_version;
+        let refused =
+            crate::services::connection_orchestrator::is_protocol_downgrade(&state, PEER_ID, 8)
+                .await;
+        state.shutdown.cancel();
+        assert_eq!(stored, 8);
+        assert!(!refused, "the real protocol-8 phone would now be refused");
     }
 }
