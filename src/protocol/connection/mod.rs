@@ -24,6 +24,9 @@ pub(crate) use tls::TlsStream;
 pub(crate) struct Connection {
     pub(crate) read_stream: Mutex<BufReader<tokio::io::ReadHalf<TlsStream>>>,
     pub(crate) write_stream: Mutex<tokio::io::WriteHalf<TlsStream>>,
+    /// Set under the write lock when a write fails, so sends queued behind it
+    /// fail at once instead of each waiting out the deadline on a dead stream.
+    pub(crate) write_failed: std::sync::atomic::AtomicBool,
     pub(crate) info: Mutex<ConnectionInfo>,
     pub(crate) generation: u64,
     pub(crate) peer_cert: Option<Vec<u8>>,
@@ -612,7 +615,22 @@ impl ConnectionManager {
 
         let outcome = {
             let mut write_stream = conn_handle.write_stream.lock().await;
-            Self::write_framed(&mut *write_stream, &bytes, device_id).await
+            if conn_handle
+                .write_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(Error::ConnectionError(format!(
+                    "Connection to {} failed on an earlier write",
+                    device_id
+                )));
+            }
+            let outcome = Self::write_framed(&mut *write_stream, &bytes, device_id).await;
+            if outcome.is_err() {
+                conn_handle
+                    .write_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            outcome
         };
 
         match outcome {

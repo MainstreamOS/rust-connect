@@ -182,6 +182,75 @@ async fn test_packet_write_to_stalled_peer_remains_bounded() {
     assert!(matches!(result, Err(Error::ConnectionTimeout(_))));
 }
 
+#[tokio::test]
+async fn test_sends_queued_behind_a_failed_write_fail_at_once() {
+    init_crypto();
+    let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
+    let cert_manager = Arc::new(CertificateManager::new(temp_dir.path().to_path_buf()));
+    cert_manager.init().expect("Value expected to be present");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Value expected to be present");
+    let addr = listener.local_addr().expect("Value expected to be present");
+    let client_cm = Arc::new(
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"),
+    );
+    let server_cm =
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present");
+    server_cm.set_device_identity("server-self-aaaaaaaaaaaaaaaaaaaa", "Test Server");
+    let server_handle = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("Value expected to be present");
+        server_cm
+            .accept_test("client-deviceaaaaaaaaaaaaaaaaaaa".to_string(), stream)
+            .await
+            .expect("Value expected to be present");
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    });
+    let server_device_id = "server-deviceaaaaaaaaaaaaaaaaaaa".to_string();
+    client_cm
+        .connect(&server_device_id, addr)
+        .await
+        .expect("Value expected to be present");
+
+    // Fill the peer's buffers until a send stalls holding the write lock.
+    let filler = {
+        let cm = client_cm.clone();
+        let id = server_device_id.clone();
+        tokio::spawn(async move {
+            let big = Packet::new(
+                "kdeconnect.test".to_string(),
+                serde_json::json!({ "blob": "x".repeat(4 * 1024 * 1024) }),
+            );
+            for _ in 0..64 {
+                if cm.send_packet(&id, &big).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let queued: Vec<_> = (0..3)
+        .map(|_| {
+            let cm = client_cm.clone();
+            let id = server_device_id.clone();
+            tokio::spawn(async move { cm.send_packet(&id, &Packet::ping()).await })
+        })
+        .collect();
+    filler.await.expect("filler completes");
+    let failed_at = std::time::Instant::now();
+    for send in queued {
+        assert!(send.await.expect("send completes").is_err());
+    }
+    assert!(
+        failed_at.elapsed() < Duration::from_secs(2),
+        "queued sends must not each wait out the deadline on a dead stream"
+    );
+    server_handle.abort();
+}
+
 /// A3 (2026-09-02 audit): `send_packet` bounds `write_all` with a finite
 /// timeout. tokio-rustls hands back partial counts under backpressure, so a
 /// timed-out write leaves part of the packet queued and the rest never

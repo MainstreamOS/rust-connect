@@ -240,6 +240,7 @@ impl ConnectionManager {
             let connection = Connection {
                 read_stream: Mutex::new(BufReader::new(read_half)),
                 write_stream: Mutex::new(write_half),
+                write_failed: std::sync::atomic::AtomicBool::new(false),
                 info: Mutex::new(ConnectionInfo::new(device_id.clone(), generation)),
                 generation,
                 peer_cert: peer_cert_der.clone(),
@@ -307,6 +308,7 @@ impl ConnectionManager {
         let connection = Connection {
             read_stream: Mutex::new(BufReader::new(read_half)),
             write_stream: Mutex::new(write_half),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
             info: Mutex::new(ConnectionInfo::new(device_id.clone(), generation)),
             generation,
             peer_cert: peer_cert_der.clone(),
@@ -352,6 +354,7 @@ impl ConnectionManager {
         let connection = Connection {
             read_stream: Mutex::new(BufReader::new(read_half)),
             write_stream: Mutex::new(write_half),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
             info: Mutex::new(ConnectionInfo::new(device_id.clone(), generation)),
             generation,
             peer_cert,
@@ -467,6 +470,7 @@ impl ConnectionManager {
         let connection = Connection {
             read_stream: Mutex::new(BufReader::new(read_half)),
             write_stream: Mutex::new(write_half),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
             info: Mutex::new(ConnectionInfo::new(device_id.clone(), generation)),
             generation,
             peer_cert,
@@ -592,6 +596,7 @@ impl ConnectionManager {
         let connection = Connection {
             read_stream: Mutex::new(BufReader::new(read_half)),
             write_stream: Mutex::new(write_half),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
             info: Mutex::new(ConnectionInfo::new(device_id.clone(), generation)),
             generation,
             peer_cert,
