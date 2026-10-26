@@ -181,75 +181,10 @@ pub async fn pair_device(
     validate_device_id(&device_id).map_err(api_err)?;
 
     if state.pairing_handler.has_incoming_request(&device_id).await {
-        // Stage the peer cert so accept_pairing can persist it
-        // (verify-before-write: this is the only write path).
-        if let Some(cert_der) = state
-            .connection_manager
-            .get_peer_certificate(&device_id)
-            .await
-        {
-            state
-                .pairing_handler
-                .set_pending_peer_cert(&device_id, cert_der)
-                .await;
-        }
-
-        // Identity anchor pre-check (vk #1056, panel f07ea4a3): the
-        // cert-anchor gate inside accept_pairing can REFUSE, and the
-        // send below runs first — a post-send refusal would leave the
-        // peer believing it is paired while we persist nothing (no
-        // unwind exists on that path). Refuse here, before pair:true
-        // goes on the wire.
-        if !state.pairing_handler.has_identity_anchor(&device_id).await {
-            let _ = state.pairing_handler.reject_pairing(&device_id).await;
-            return Err(api_err(Error::PairingRejected(format!(
-                "Refusing pairing with {}: no peer certificate (pending or pinned) was presented; \
-                 cert-less pairings are not accepted",
-                device_id
-            ))));
-        }
-
-        // Android acceptPairing (PairingHandler.kt:174-190): the pairing
-        // completes onSend success; a failed send (or an unreachable peer)
-        // fails the pairing instead — send FIRST, mark paired after, or a
-        // send failure leaves us paired while the peer isn't.
-        let send_result = if state.connection_manager.is_connected(&device_id).await {
-            let pair_pkt = crate::protocol::types::Packet::pair_response(true);
-            state
-                .connection_manager
-                .send_packet(&device_id, &pair_pkt)
-                .await
-        } else {
-            Err(Error::ConnectionError(format!(
-                "Device {} is not connected",
-                device_id
-            )))
-        };
-        if let Err(e) = send_result {
-            let _ = state.pairing_handler.reject_pairing(&device_id).await;
-            return Err(api_err(e));
-        }
-
         state
-            .pairing_handler
-            .accept_pairing(&device_id)
+            .accept_pairing_request(&device_id)
             .await
             .map_err(api_err)?;
-
-        // late-pairing plugin init: pairing just completed on a connection that was UNPAIRED
-        // at connect time, so no connect-time plugin notify ever fired —
-        // send the init advertisements (runcommand list, …) now or the
-        // phone sees nothing until reconnect.
-        //
-        // Spawned, like every other caller: the advertisement path waits
-        // briefly for a live link, and holding the HTTP response open for
-        // that wait would be reporting a pairing that is already complete.
-        let state_clone = state.clone();
-        let device_id_clone = device_id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            state_clone.send_plugin_init_packets(&device_id_clone).await;
-        });
 
         Ok(Json(ApiResponse::ok(PairResponse {
             device_id,

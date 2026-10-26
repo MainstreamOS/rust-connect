@@ -2127,6 +2127,77 @@ async fn cached_attachments_keep_readable_names_and_old_copies_are_still_found()
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_accept_clears_the_request_for_caching_clients() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let _phone = loopback_phone(&app).await;
+    app.pairing_handler.unpair(&PHONE.into()).await.unwrap();
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let client = bus.connect(None).await;
+    let device: zbus::Proxy = zbus::proxy::Builder::new(&client)
+        .destination("org.kde.kdeconnect")
+        .unwrap()
+        .path("/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .unwrap()
+        .interface("org.kde.kdeconnect.device")
+        .unwrap()
+        .cache_properties(zbus::proxy::CacheProperties::Yes)
+        .build()
+        .await
+        .unwrap();
+    let certificate = app
+        .connection_manager
+        .get_peer_certificate(&PHONE.into())
+        .await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    app.pairing_handler
+        .receive_pair_request_with_cert(&PHONE.into(), Some(now), certificate)
+        .await
+        .unwrap();
+    app.broadcaster
+        .broadcast(rust_connect::device::DeviceEvent::PairRequested {
+            device_id: PHONE.into(),
+            device_name: "Phone".into(),
+        });
+    until(|| async { device.get_property::<i32>("pairState").await.unwrap() == 2 }).await;
+    // The phone vanishes while the user considers its request.
+    let generation = app
+        .connection_manager
+        .get_generation(&PHONE.into())
+        .await
+        .unwrap();
+    app.connection_manager
+        .disconnect(&PHONE.into(), generation)
+        .await
+        .unwrap();
+    assert!(device.call::<_, _, ()>("acceptPairing", &()).await.is_err());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while device.get_property::<i32>("pairState").await.unwrap() != 0
+            || device
+                .get_property::<bool>("isPairRequestedByPeer")
+                .await
+                .unwrap()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("caching clients still show the withdrawn request");
+    service.stop().await;
+}
+
 async fn next_pair_state(states: &mut zbus::proxy::SignalStream<'_>) -> i32 {
     let signal = tokio::time::timeout(Duration::from_secs(3), states.next())
         .await
@@ -2312,7 +2383,27 @@ async fn a_phone_asking_to_pair_can_be_accepted_or_declined_over_dbus() {
             }
             let event = bridge_event(&mut output, "pairRequests").await;
             assert!(event["requests"].as_array().unwrap().is_empty());
+            app.pairing_handler.unpair(&PHONE.into()).await.unwrap();
+            while next_pair_state(&mut states).await != 0 {}
         }
+
+        // An accept that cannot reach the phone withdraws the request.
+        ask().await;
+        assert_eq!(next_pair_state(&mut states).await, 2);
+        let generation = app
+            .connection_manager
+            .get_generation(&PHONE.into())
+            .await
+            .unwrap();
+        app.connection_manager
+            .disconnect(&PHONE.into(), generation)
+            .await
+            .unwrap();
+        assert!(device.call::<_, _, ()>("acceptPairing", &()).await.is_err());
+        assert!(!device
+            .get_property::<bool>("isPairRequestedByPeer")
+            .await
+            .unwrap());
     })
     .await
     .unwrap();

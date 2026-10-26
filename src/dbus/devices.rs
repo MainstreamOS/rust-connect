@@ -163,7 +163,6 @@ impl DeviceApi {
         if self.paired().await {
             return Ok(());
         }
-        self.stage_peer_certificate().await;
         let pairing = &self.context.app.pairing_handler;
         if pairing.has_incoming_request(&self.device).await {
             self.accept_incoming().await?;
@@ -172,6 +171,8 @@ impl DeviceApi {
                 .initiate_pairing(&self.device)
                 .await
                 .map_err(failure)?;
+            // After initiate_pairing, whose expiry sweep drops staged certificates.
+            self.stage_peer_certificate().await;
             if let Err(e) = self
                 .context
                 .app
@@ -196,7 +197,6 @@ impl DeviceApi {
     #[zbus(name = "acceptPairing")]
     async fn accept_pairing(&self) -> zbus::fdo::Result<()> {
         self.value().await?;
-        self.stage_peer_certificate().await;
         if !self
             .context
             .app
@@ -296,26 +296,12 @@ impl DeviceApi {
         }
     }
     async fn accept_incoming(&self) -> zbus::fdo::Result<()> {
-        let pairing = &self.context.app.pairing_handler;
-        if !pairing.has_identity_anchor(&self.device).await {
-            return Err(failure("No peer certificate"));
+        let accepted = self.context.app.accept_pairing_request(&self.device).await;
+        if accepted.is_err() {
+            // The failure withdrew the request; clients still show it.
+            let _ = self.context.pair_state_changed(&self.device).await;
         }
-        self.context
-            .app
-            .connection_manager
-            .send_packet(&self.device, &Packet::pair_response(true))
-            .await
-            .map_err(failure)?;
-        pairing
-            .accept_pairing(&self.device)
-            .await
-            .map_err(failure)?;
-        let app = self.context.app.clone();
-        let device = self.device.clone();
-        tokio::spawn(async move {
-            app.send_plugin_init_packets(&device).await;
-        });
-        Ok(())
+        accepted.map_err(failure)
     }
 }
 

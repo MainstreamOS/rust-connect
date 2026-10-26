@@ -203,6 +203,76 @@ impl AppState {
     /// hang. When every pass fails, the connect-time path in the listener
     /// still re-advertises on the next connection — this only closes the gap
     /// until then.
+    /// Accept a phone's pending pairing request, for the REST API and the
+    /// desktop compatibility service alike. Any refusal or failure withdraws
+    /// the request so the phone is not left waiting on one that cannot finish.
+    pub async fn accept_pairing_request(
+        self: &Arc<Self>,
+        device_id: &crate::device::types::DeviceId,
+    ) -> crate::utils::Result<()> {
+        // Stage the peer cert so accept_pairing can persist it
+        // (verify-before-write: this is the only write path).
+        if let Some(cert_der) = self
+            .connection_manager
+            .get_peer_certificate(device_id)
+            .await
+        {
+            self.pairing_handler
+                .set_pending_peer_cert(device_id, cert_der)
+                .await;
+        }
+
+        // Identity anchor pre-check (vk #1056, panel f07ea4a3): the
+        // cert-anchor gate inside accept_pairing can REFUSE, and the
+        // send below runs first — a post-send refusal would leave the
+        // peer believing it is paired while we persist nothing. Refuse
+        // here, before pair:true goes on the wire.
+        if !self.pairing_handler.has_identity_anchor(device_id).await {
+            let _ = self.pairing_handler.reject_pairing(device_id).await;
+            return Err(crate::utils::Error::PairingRejected(format!(
+                "Refusing pairing with {}: no peer certificate (pending or pinned) was presented; \
+                 cert-less pairings are not accepted",
+                device_id
+            )));
+        }
+
+        // Android acceptPairing (PairingHandler.kt:174-190): the pairing
+        // completes onSend success; a failed send (or an unreachable peer)
+        // fails the pairing instead — send FIRST, mark paired after, or a
+        // send failure leaves us paired while the peer isn't.
+        let send_result = if self.connection_manager.is_connected(device_id).await {
+            self.connection_manager
+                .send_packet(
+                    device_id,
+                    &crate::protocol::types::Packet::pair_response(true),
+                )
+                .await
+        } else {
+            Err(crate::utils::Error::ConnectionError(format!(
+                "Device {} is not connected",
+                device_id
+            )))
+        };
+        if let Err(e) = send_result {
+            let _ = self.pairing_handler.reject_pairing(device_id).await;
+            return Err(e);
+        }
+
+        self.pairing_handler.accept_pairing(device_id).await?;
+
+        // late-pairing plugin init: pairing just completed on a connection
+        // that was UNPAIRED at connect time, so no connect-time plugin notify
+        // ever fired. Spawned: the advertisement path waits briefly for a
+        // live link, and the caller is reporting a pairing already complete.
+        let state = self.clone();
+        let device_id = device_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            state.send_plugin_init_packets(&device_id).await;
+        });
+        Ok(())
+    }
+
     pub async fn send_plugin_init_packets(&self, device_id: &crate::device::types::DeviceId) {
         const ATTEMPTS: usize = 3;
         const LINK_WAIT: Duration = Duration::from_secs(2);
