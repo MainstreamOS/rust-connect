@@ -1611,10 +1611,10 @@ async fn overflowed_message_ids_report_errors_and_do_not_stop_other_threads() {
     }).await.unwrap();
     let (value,): (OwnedValue,) = valid.body().deserialize().unwrap();
     assert_eq!(Message::try_from(value).unwrap().uid, 9);
-    assert!(proxy
-        .call::<_, _, Vec<OwnedValue>>("activeConversations", &())
-        .await
-        .is_err());
+    // The list still carries every other thread.
+    let active: Vec<OwnedValue> = proxy.call("activeConversations", &()).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(Message::try_from(active[0].clone()).unwrap().uid, 9);
     assert!(proxy
         .call::<_, _, ()>("requestConversation", &(42i64, 0i32, 50i32))
         .await

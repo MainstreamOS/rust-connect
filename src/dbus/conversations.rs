@@ -181,7 +181,10 @@ impl Conversations {
                 .get_thread(&self.device, thread.thread_id)
                 .last()
             {
-                let message = Message::try_from(message)?;
+                // As with live signals, a thread whose message D-Bus cannot carry is skipped.
+                let Ok(message) = Message::try_from(message) else {
+                    continue;
+                };
                 result.push(OwnedValue::try_from(Value::from(message)).map_err(failure)?);
             }
         }
