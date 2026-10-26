@@ -159,7 +159,10 @@ async fn test_packet_write_survives_transient_backpressure() {
     let receiving = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let mut received = Vec::new();
-        reader.read_to_end(&mut received).await.unwrap();
+        reader
+            .read_to_end(&mut received)
+            .await
+            .expect("receive the packet once the phone reads again");
         received
     });
 
@@ -167,7 +170,7 @@ async fn test_packet_write_survives_transient_backpressure() {
         .await
         .expect("a phone briefly pausing its reads must not lose the connection");
     drop(writer);
-    assert_eq!(receiving.await.unwrap(), bytes);
+    assert_eq!(receiving.await.expect("receiver task completes"), bytes);
 }
 
 #[tokio::test(start_paused = true)]
