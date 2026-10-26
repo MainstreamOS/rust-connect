@@ -1,11 +1,48 @@
 //! Rebuild shell-facing state when a broadcast receiver falls behind. The
 //! journal/revision checks also make queued pre-recovery events idempotent.
 use super::{compat, Context, ROOT};
+use crate::protocol::types::Packet;
 use std::{collections::HashSet, sync::Arc};
 
 /// How long a device's message batches must stop before missing threads
 /// count as removed. The reconnect burst takes a second or two.
 const THREAD_SYNC_QUIET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A device whose messages are arriving, and how far confirming missing
+/// threads has got.
+pub(crate) struct ThreadSync {
+    last: std::time::Instant,
+    phase: Phase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    Syncing,
+    /// The full list was asked for again; nothing has come back yet.
+    Confirming,
+    /// The phone sent conversations after being asked again.
+    Answered,
+}
+
+#[derive(Debug, PartialEq)]
+enum Settled {
+    Unchanged,
+    /// Threads are missing, but the sync may have been cut short: a reconnect
+    /// empties the phone's threads and one later batch can look complete.
+    Confirm,
+    Removed(Vec<i64>),
+}
+
+fn settle(previous: &HashSet<i64>, current: &HashSet<i64>, phase: Phase) -> Settled {
+    let removed = removed_threads(previous, current);
+    match phase {
+        _ if removed.is_empty() => Settled::Unchanged,
+        Phase::Syncing => Settled::Confirm,
+        // Silence confirms nothing: the threads stay.
+        Phase::Confirming => Settled::Unchanged,
+        Phase::Answered => Settled::Removed(removed),
+    }
+}
 
 /// Threads the shell knows that a settled sync no longer has. None while the
 /// thread cap may have evicted some, since those can still exist on the phone.
@@ -34,25 +71,35 @@ impl Context {
         self.thread_syncs
             .lock()
             .await
-            .insert(device.into(), std::time::Instant::now());
+            .entry(device.into())
+            .and_modify(|sync| {
+                sync.last = std::time::Instant::now();
+                if sync.phase == Phase::Confirming {
+                    sync.phase = Phase::Answered;
+                }
+            })
+            .or_insert(ThreadSync {
+                last: std::time::Instant::now(),
+                phase: Phase::Syncing,
+            });
         current
     }
     /// Report threads that are really gone, once a connected device has sent
-    /// nothing for `THREAD_SYNC_QUIET`.
+    /// nothing for `THREAD_SYNC_QUIET`, and again after asking for its list.
     pub(crate) async fn settle_threads(&self) -> zbus::Result<()> {
-        let settled: Vec<String> = {
+        let settled: Vec<(String, Phase)> = {
             let mut syncs = self.thread_syncs.lock().await;
-            let quiet: Vec<String> = syncs
+            let quiet: Vec<(String, Phase)> = syncs
                 .iter()
-                .filter(|(_, last)| last.elapsed() >= THREAD_SYNC_QUIET)
-                .map(|(device, _)| device.clone())
+                .filter(|(_, sync)| sync.last.elapsed() >= THREAD_SYNC_QUIET)
+                .map(|(device, sync)| (device.clone(), sync.phase))
                 .collect();
-            for device in &quiet {
+            for (device, _) in &quiet {
                 syncs.remove(device);
             }
             quiet
         };
-        for device in settled {
+        for (device, phase) in settled {
             if !self.app.connection_manager.is_connected(&device).await {
                 continue;
             }
@@ -60,11 +107,37 @@ impl Context {
             let removed = {
                 let mut known = self.known_threads.lock().await;
                 let previous = known.entry(device.clone()).or_default();
-                let removed = removed_threads(previous, &current);
-                for thread in &removed {
-                    previous.remove(thread);
+                match settle(previous, &current, phase) {
+                    Settled::Unchanged => continue,
+                    Settled::Confirm => None,
+                    Settled::Removed(removed) => {
+                        for thread in &removed {
+                            previous.remove(thread);
+                        }
+                        Some(removed)
+                    }
                 }
-                removed
+            };
+            let Some(removed) = removed else {
+                let request = Packet::new(
+                    "kdeconnect.sms.request_conversations".to_string(),
+                    serde_json::json!({}),
+                );
+                match self.send(&device, request).await {
+                    Ok(()) => {
+                        self.thread_syncs.lock().await.insert(
+                            device.clone(),
+                            ThreadSync {
+                                last: std::time::Instant::now(),
+                                phase: Phase::Confirming,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not ask the phone to confirm its conversations");
+                    }
+                }
+                continue;
             };
             for thread in removed {
                 self.emit(
@@ -279,5 +352,27 @@ mod tests {
         let previous: HashSet<i64> = (0..limit + 10).collect();
         let current: HashSet<i64> = (10..limit + 10).collect();
         assert!(removed_threads(&previous, &current).is_empty());
+    }
+
+    #[test]
+    fn missing_threads_are_removed_only_after_the_phone_answers_again() {
+        let previous = HashSet::from([1, 2, 3]);
+        let partial = HashSet::from([2]);
+        assert_eq!(
+            settle(&previous, &partial, Phase::Syncing),
+            Settled::Confirm
+        );
+        assert_eq!(
+            settle(&previous, &partial, Phase::Confirming),
+            Settled::Unchanged
+        );
+        assert_eq!(
+            settle(&previous, &partial, Phase::Answered),
+            Settled::Removed(vec![1, 3])
+        );
+        assert_eq!(
+            settle(&previous, &previous, Phase::Syncing),
+            Settled::Unchanged
+        );
     }
 }

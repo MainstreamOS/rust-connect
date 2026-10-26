@@ -49,7 +49,7 @@ pub(crate) struct Context {
     watched_threads: Mutex<HashSet<(String, i64)>>,
     known_threads: Mutex<HashMap<String, HashSet<i64>>>,
     /// When each device last sent messages, until `settle_threads` checks it.
-    thread_syncs: Mutex<HashMap<String, std::time::Instant>>,
+    thread_syncs: Mutex<HashMap<String, recovery::ThreadSync>>,
     /// When each reconnected device last sent a notification, until
     /// `settle_notifications` drops the ones it no longer has.
     notification_syncs: Mutex<HashMap<String, std::time::Instant>>,
@@ -425,6 +425,8 @@ impl Context {
             | DeviceEvent::Removed { device_id } => device_id,
         };
         if disconnected {
+            // A reconnect starts its conversation sync afresh.
+            self.thread_syncs.lock().await.remove(&device);
             let info = crate::plugins::telephony::TelephonyInfo {
                 event: "ringing".into(),
                 phone_number: None,
