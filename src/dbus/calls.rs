@@ -66,16 +66,14 @@ impl Context {
             }
         }) {
             if data.starts_with(b"\xff\xd8\xff") || data.starts_with(b"\x89PNG\r\n\x1a\n") {
-                let folder = self.app.settings.data_dir.join("call-images");
-                if let Err(error) = compat::private_directory(&folder).await {
+                let path = crate::plugins::caller_picture_path(&self.app.settings.data_dir, device);
+                let folder = path.parent().unwrap_or(&self.app.settings.data_dir);
+                if let Err(error) = compat::private_directory(folder).await {
                     tracing::warn!(%error,"Could not cache call picture");
-                } else {
-                    let path = folder.join(crate::plugins::sms::attachment_filename(device));
-                    if tokio::fs::write(&path, &data).await.is_ok()
-                        && compat::private_file(&path).await.is_ok()
-                    {
-                        picture = Some(path)
-                    }
+                } else if tokio::fs::write(&path, &data).await.is_ok()
+                    && compat::private_file(&path).await.is_ok()
+                {
+                    picture = Some(path)
                 }
             }
         }

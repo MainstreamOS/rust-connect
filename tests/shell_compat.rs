@@ -408,6 +408,125 @@ async fn pair(app: &AppState, certificate: Vec<u8>) {
         .unwrap();
 }
 
+/// `state` with the test phone paired over a certificate of its own.
+async fn paired_state(directory: &std::path::Path) -> Arc<AppState> {
+    let app = state(directory).await;
+    let phone = tempfile::tempdir().unwrap();
+    let (pem, _) = rust_connect::protocol::CertificateManager::new(phone.path().into())
+        .generate_certificate(PHONE, "Phone")
+        .unwrap();
+    pair(
+        &app,
+        openssl::x509::X509::from_pem(&pem)
+            .unwrap()
+            .to_der()
+            .unwrap(),
+    )
+    .await;
+    app
+}
+
+/// What a trusted phone leaves on disk: an MMS attachment, a notification
+/// icon and its caller picture.
+fn phone_files(app: &AppState, phone: &str) -> [std::path::PathBuf; 3] {
+    let attachment = app.plugins.sms.attachment_path(phone, "PART_42").unwrap();
+    let icon = app
+        .settings
+        .data_dir
+        .join("notification-icons")
+        .join(phone)
+        .join("c".repeat(32));
+    let picture = rust_connect::plugins::caller_picture_path(&app.settings.data_dir, phone);
+    for path in [&attachment, &icon, &picture] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"cached").unwrap();
+    }
+    [attachment, icon, picture]
+}
+
+async fn api_status(app: &Arc<AppState>, method: &str, path: &str) -> axum::http::StatusCode {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("X-API-Key", "private-bus-test")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    rust_connect::api::build_router(app.clone())
+        .oneshot(request)
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn unpairing_without_the_desktop_service_deletes_what_the_phone_left() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = paired_state(temp.path()).await;
+    let files = phone_files(&app, PHONE);
+    let unpair = format!("/api/v1/devices/{PHONE}/unpair");
+    assert_eq!(
+        api_status(&app, "DELETE", &unpair).await,
+        axum::http::StatusCode::OK
+    );
+    assert!(!app.pairing_handler.is_paired(&PHONE.into()).await);
+    for file in files {
+        assert!(!file.exists(), "{} outlived the unpair", file.display());
+    }
+}
+
+#[tokio::test]
+async fn a_phone_unpairing_us_deletes_what_it_left() {
+    // The phone's own pair=false ends in the same call as every other unpair.
+    let temp = tempfile::tempdir().unwrap();
+    let app = paired_state(temp.path()).await;
+    let files = phone_files(&app, PHONE);
+    app.pairing_handler.unpair(&PHONE.into()).await.unwrap();
+    for file in files {
+        assert!(!file.exists(), "{} outlived the unpair", file.display());
+    }
+}
+
+#[tokio::test]
+async fn a_paired_phones_icons_stay_readable_and_an_unpaired_ones_are_not_served() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = paired_state(temp.path()).await;
+    let gone = "b".repeat(32);
+    phone_files(&app, PHONE);
+    phone_files(&app, &gone);
+    let hash = "c".repeat(32);
+    let icon = |phone: &str| format!("/api/v1/devices/{phone}/notification-icons/{hash}");
+    assert_eq!(
+        api_status(&app, "GET", &icon(PHONE)).await,
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(
+        api_status(&app, "GET", &icon(&gone)).await,
+        axum::http::StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn files_of_phones_no_longer_paired_are_swept_and_a_paired_ones_kept() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = paired_state(temp.path()).await;
+    let kept = phone_files(&app, PHONE);
+    let stale = phone_files(&app, &"b".repeat(32));
+    let paired = std::collections::HashSet::from([PHONE.to_string()]);
+    rust_connect::plugins::forget_files_of_unpaired(&app.plugins, &app.settings.data_dir, &paired)
+        .await;
+    for file in kept {
+        assert!(
+            file.exists(),
+            "{} belongs to a paired phone",
+            file.display()
+        );
+    }
+    for file in stale {
+        assert!(!file.exists(), "{} outlived its pairing", file.display());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contact_photos_are_published_atomically_and_removed_when_revoked() {
     use rust_connect::protocol::CertificateManager;
@@ -1827,6 +1946,14 @@ async fn notification_icons_follow_exact_updates_and_late_cache_availability() {
         <&str>::try_from(&hints.lock().unwrap()[5]["image-path"]).unwrap(),
         rust_connect::utils::compat::file_uri(&cache.join(late))
     );
+    // A disconnect keeps the icons the shell still shows; revoking deletes them.
+    app.plugins.notification.on_disconnected(PHONE).await;
+    assert!(cache.join(late).exists());
+    app.broadcaster
+        .broadcast(rust_connect::device::DeviceEvent::Unpaired {
+            device_id: PHONE.into(),
+        });
+    until(|| async { !cache.exists() }).await;
     service.stop().await;
 }
 

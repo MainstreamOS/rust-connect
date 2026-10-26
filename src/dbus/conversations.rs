@@ -310,6 +310,16 @@ impl Conversations {
         if part < 0 || identifier.is_empty() || identifier.len() > 1024 {
             return Err(failure("Invalid attachment identity"));
         }
+        // Cached copies open while the phone is away, but never once it is revoked.
+        if !self
+            .context
+            .app
+            .pairing_handler
+            .is_paired(&self.device)
+            .await
+        {
+            return Err(failure("Phone is not paired"));
+        }
         if let Some(path) = self
             .context
             .app

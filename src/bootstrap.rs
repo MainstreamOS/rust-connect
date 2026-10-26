@@ -230,12 +230,13 @@ async fn load_persisted_data(state: &Arc<AppState>) {
             warn!(error = %e, "Failed to load device registry from disk, starting with empty state");
         }
     }
-    match state.pairing_handler.load_from_disk().await {
-        Ok(()) => {}
+    let pairing_loaded = match state.pairing_handler.load_from_disk().await {
+        Ok(()) => true,
         Err(e) => {
             warn!(error = %e, "Failed to load pairing state from disk, starting with empty state");
+            false
         }
-    }
+    };
 
     // Prune AFTER the pairing store has loaded — it is the authority for
     // what counts as paired, and an empty one would prune everything.
@@ -253,6 +254,16 @@ async fn load_persisted_data(state: &Arc<AppState>) {
             "Pruned stale device records at startup"
         );
     }
+    // Only against a store that loaded: after a failed read every phone
+    // would count as unpaired and lose its files.
+    if pairing_loaded {
+        crate::plugins::forget_files_of_unpaired(
+            &state.plugins,
+            &state.settings.data_dir,
+            &paired_ids,
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +271,27 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+
+    /// A pairing store that cannot be read says nothing about which phones
+    /// are paired, so their cached files stay.
+    #[tokio::test]
+    async fn an_unreadable_pairing_store_leaves_phone_files_alone() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let state = Arc::new(
+            AppState::new_without_input(AppSettings::new_with_data_dir(temp.path().into()))
+                .expect("state"),
+        );
+        let icon = temp
+            .path()
+            .join("notification-icons")
+            .join("p".repeat(32))
+            .join("c".repeat(32));
+        std::fs::create_dir_all(icon.parent().unwrap()).expect("icon dir");
+        std::fs::write(&icon, b"cached").expect("icon");
+        std::fs::write(temp.path().join("paired.json"), b"not json").expect("store");
+        load_persisted_data(&state).await;
+        assert!(icon.exists());
+    }
 
     /// Panel P1 (review-20260820T235242Z, codex + grok-46): without
     /// `--config`, the default config path was never read, so a documented

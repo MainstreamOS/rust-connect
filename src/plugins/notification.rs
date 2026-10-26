@@ -314,6 +314,30 @@ impl NotificationPlugin {
         Self::is_regular_icon(&path).then_some(path)
     }
 
+    /// Delete every cached icon of a device, including ones from earlier runs.
+    pub fn forget_icons(&self, device_id: &str) {
+        self.icon_lru
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id);
+        if Self::valid_device_component(device_id) {
+            let _ = std::fs::remove_dir_all(self.icon_root.join(device_id));
+        }
+    }
+
+    /// Delete the cached icons of every device not in `keep`.
+    pub fn forget_icons_except(&self, keep: &std::collections::HashSet<String>) {
+        let Ok(entries) = std::fs::read_dir(&self.icon_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let device = entry.file_name().to_string_lossy().into_owned();
+            if !keep.contains(&device) {
+                self.forget_icons(&device);
+            }
+        }
+    }
+
     fn record_icon(&self, device_id: &str, hash: &str) {
         let normalized = hash.to_ascii_lowercase();
         let evicted = {
@@ -785,22 +809,13 @@ impl Plugin for NotificationPlugin {
             }
         }
 
-        if self
+        // The compatibility desktop keeps its records, and their icons, until
+        // the phone is revoked.
+        if !self
             .compatibility_desktop
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return;
-        }
-        let hashes = self
-            .icon_lru
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(device_id)
-            .unwrap_or_default();
-        for hash in hashes {
-            if let Some(path) = self.icon_path(device_id, &hash) {
-                let _ = std::fs::remove_file(path);
-            }
+            self.forget_icons(device_id);
         }
     }
 

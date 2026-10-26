@@ -580,6 +580,13 @@ impl Context {
                 .notification_event(notifications::cancelled(device, id))
                 .await;
         }
+        crate::plugins::forget_device_files(
+            &self.app.plugins.sms,
+            &self.app.plugins.notification,
+            &self.app.settings.data_dir,
+            device,
+        )
+        .await;
         self.notification_syncs.lock().await.remove(device);
         self.trusted.lock().await.remove(device);
         self.contact_revisions.lock().await.remove(device);

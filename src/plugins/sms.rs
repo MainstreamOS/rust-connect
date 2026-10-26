@@ -213,6 +213,32 @@ impl SmsPlugin {
         self
     }
 
+    /// Delete a revoked phone's cached attachments.
+    pub async fn forget_attachments(&self, device: &str) {
+        if let Some(runtime) = &self.runtime {
+            runtime.attachments.cancel_device(device);
+            let _ =
+                tokio::fs::remove_dir_all(runtime.cache.join(attachment_filename(device))).await;
+        }
+    }
+
+    /// Delete the cached attachments of every phone whose folder, named by
+    /// `attachment_filename` of its id, is not in `keep`.
+    pub async fn forget_attachments_except(&self, keep: &std::collections::HashSet<String>) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let Ok(mut entries) = tokio::fs::read_dir(&runtime.cache).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let folder = entry.file_type().await.is_ok_and(|kind| kind.is_dir());
+            if folder && !keep.contains(entry.file_name().to_string_lossy().as_ref()) {
+                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+            }
+        }
+    }
+
     /// Where an attachment is cached: its existing copy, one cached under the
     /// digest attachments were named by before, or where a new copy goes.
     pub fn attachment_path(&self, device: &str, identifier: &str) -> Option<PathBuf> {

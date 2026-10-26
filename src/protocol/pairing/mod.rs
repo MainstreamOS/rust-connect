@@ -55,6 +55,11 @@ pub const PAIR_REQUEST_TIMEOUT_SECS: i64 = 30;
 /// 25 seconds; the requester times out at 30, so the accepter gives up first).
 pub const PAIR_ACCEPT_TIMEOUT_SECS: i64 = 25;
 
+/// Deletes what a phone left on disk while it was trusted; see
+/// `PairingHandler::set_revocation_hook`.
+pub type RevocationHook =
+    Arc<dyn Fn(DeviceId) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
 pub struct PairingHandler {
     cert_manager: Arc<CertificateManager>,
     outgoing: Arc<RwLock<HashMap<DeviceId, PairingRequest>>>,
@@ -105,6 +110,9 @@ pub struct PairingHandler {
     /// `with_broadcaster`; `app.rs` constructs the handler AFTER
     /// the broadcaster exists and threads it in.
     broadcaster: Option<Arc<PairingBroadcaster>>,
+    /// Set once the plugins that own a phone's cached files exist, which is
+    /// after this handler is shared.
+    revocation: std::sync::OnceLock<RevocationHook>,
 }
 
 impl PairingHandler {
@@ -121,7 +129,15 @@ impl PairingHandler {
             persist_path: None,
             own_device_id: Arc::new(RwLock::new(None)),
             broadcaster: None,
+            revocation: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Run `hook` on every removed pairing, after its pin is deleted. Every
+    /// unpair passes through `unpair`, from the REST API, the desktop service
+    /// or the phone itself, so the cleanup does not depend on which one asked.
+    pub fn set_revocation_hook(&self, hook: RevocationHook) {
+        let _ = self.revocation.set(hook);
     }
 
     pub fn with_persistence(mut self, path: PathBuf) -> Self {
@@ -691,6 +707,9 @@ impl PairingHandler {
         if removed {
             let _ = self.cert_manager.delete_certificate(device_id);
             let _ = self.cert_manager.delete_peer_certificate(device_id);
+            if let Some(forget) = self.revocation.get() {
+                forget(device_id.clone()).await;
+            }
             info!(
                 device_id = %device_id,
                 event = "device_unpaired",

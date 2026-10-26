@@ -113,6 +113,23 @@ impl AppState {
             .runcommand
             .register_from_config(&settings.runcommand);
 
+        // Weak: the plugins hold the pairing handler too.
+        let sms = Arc::downgrade(&plugins.sms);
+        let notification = Arc::downgrade(&plugins.notification);
+        let data_dir = settings.data_dir.clone();
+        pairing_handler.set_revocation_hook(Arc::new(move |device| {
+            use futures::FutureExt;
+            let (sms, notification, data_dir) =
+                (sms.clone(), notification.clone(), data_dir.clone());
+            async move {
+                if let (Some(sms), Some(notification)) = (sms.upgrade(), notification.upgrade()) {
+                    crate::plugins::forget_device_files(&sms, &notification, &data_dir, &device)
+                        .await;
+                }
+            }
+            .boxed()
+        }));
+
         Ok(Self {
             settings,
             registry,

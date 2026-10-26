@@ -131,3 +131,47 @@ impl PluginAccess {
         ]
     }
 }
+
+/// Where a phone's caller picture is cached.
+pub fn caller_picture_path(data_dir: &std::path::Path, device: &str) -> std::path::PathBuf {
+    data_dir
+        .join("call-images")
+        .join(sms::attachment_filename(device))
+}
+
+/// Delete what a phone left on disk while it was trusted: its notification
+/// icons, its MMS attachments (stopping any still downloading) and its caller
+/// picture. Unpairing runs this whatever asked for it, desktop service or not.
+pub async fn forget_device_files(
+    sms: &SmsPlugin,
+    notification: &NotificationPlugin,
+    data_dir: &std::path::Path,
+    device: &str,
+) {
+    notification.forget_icons(device);
+    sms.forget_attachments(device).await;
+    let _ = tokio::fs::remove_file(caller_picture_path(data_dir, device)).await;
+}
+
+/// The same files for every phone that is no longer paired, for leftovers an
+/// unpair could not reach, such as one interrupted before it deleted them.
+pub async fn forget_files_of_unpaired(
+    plugins: &PluginAccess,
+    data_dir: &std::path::Path,
+    paired: &std::collections::HashSet<String>,
+) {
+    plugins.notification.forget_icons_except(paired);
+    let kept: std::collections::HashSet<_> = paired
+        .iter()
+        .map(|id| sms::attachment_filename(id))
+        .collect();
+    plugins.sms.forget_attachments_except(&kept).await;
+    let pictures = data_dir.join("call-images");
+    if let Ok(mut entries) = tokio::fs::read_dir(&pictures).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if !kept.contains(entry.file_name().to_string_lossy().as_ref()) {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+}

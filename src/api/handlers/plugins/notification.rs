@@ -260,7 +260,13 @@ pub async fn get_notification_icon(
     axum::extract::Path((device_id, icon_hash)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
-    let Some(path) = state.plugins.notification.icon_path(&device_id, &icon_hash) else {
+    // A paired phone's icons stay readable while it is away; an unpaired
+    // one's leftovers are not served, whether or not they were deleted yet.
+    let paired = state.pairing_handler.is_paired(&device_id).await;
+    let path = paired
+        .then(|| state.plugins.notification.icon_path(&device_id, &icon_hash))
+        .flatten();
+    let Some(path) = path else {
         return Err(api_err(Error::not_found(
             "notification icon",
             Some(format!("{device_id}/{icon_hash}")),
