@@ -46,22 +46,10 @@ pub fn local_file(url: &str) -> zbus::fdo::Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf8(bytes).map_err(failure)?))
 }
 
-fn mount_root(info: &SftpConnectionInfo) -> PathBuf {
-    let mut root = PathBuf::from(&info.path);
-    for path in &info.multi_paths {
-        while !Path::new(path).starts_with(&root) {
-            if !root.pop() {
-                return PathBuf::from("/");
-            }
-        }
-    }
-    root
-}
-
 /// Return LOCAL roots: mounting /storage/emulated/0 puts its contents at the
 /// mountpoint, so appending /storage/emulated/0 again would hide every file.
 pub fn directory_roots(info: &SftpConnectionInfo, mount: &Path) -> BTreeMap<String, OwnedValue> {
-    let root = mount_root(info);
+    let root = info.mount_root();
     let paths = if info.multi_paths.is_empty() {
         vec![info.path.clone()]
     } else {
@@ -205,10 +193,22 @@ impl Sftp {
     #[zbus(name = "mountAndWait")]
     async fn mount(&self) -> zbus::fdo::Result<bool> {
         self.context.require_device(&self.device).await?;
-        if self.is_mounted() {
-            return Ok(true);
-        }
         let plugin = &self.context.app.plugins.sftp;
+        // Join a mount already under way: asking the phone again would send
+        // fresh credentials, and those remount what is being mounted.
+        let settle = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while matches!(
+            plugin.get_mount_status(&self.device).state,
+            MountState::Mounting
+        ) && tokio::time::Instant::now() < settle
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        match plugin.get_mount_status(&self.device).state {
+            MountState::Mounted => return Ok(true),
+            MountState::Mounting => return Err(failure("Phone files are still mounting")),
+            _ => {}
+        }
         // Android may stop its SSH server while the main connection stays
         // alive. Cached credentials alone do not mean it is still listening.
         // Subscribe before requesting so even an immediate reply is observed.
@@ -222,10 +222,9 @@ impl Sftp {
         )
         .await
         .map_err(|_| failure("Phone did not refresh file-browsing credentials"))??;
-        let mut info = plugin
+        let info = plugin
             .get_connection(&self.device)
             .ok_or_else(|| failure("Phone did not provide file-browsing credentials"))?;
-        info.path = mount_root(&info).to_string_lossy().into_owned();
         let status = plugin
             .mount_device(&self.device, &info)
             .await

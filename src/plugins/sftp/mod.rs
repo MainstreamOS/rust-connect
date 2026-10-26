@@ -50,6 +50,23 @@ pub struct SftpConnectionInfo {
     pub path_names: Vec<String>,
 }
 
+impl SftpConnectionInfo {
+    /// The remote folder that holds every storage path the phone offers.
+    /// KDE mounts the phone's root when it lists several; this is the
+    /// narrowest folder that still holds them all.
+    pub fn mount_root(&self) -> std::path::PathBuf {
+        let mut root = std::path::PathBuf::from(&self.path);
+        for path in &self.multi_paths {
+            while !std::path::Path::new(path).starts_with(&root) {
+                if !root.pop() {
+                    return std::path::PathBuf::from("/");
+                }
+            }
+        }
+        root
+    }
+}
+
 /// `Debug` is hand-rolled to redact the password. The derived form would
 /// include the plaintext (sftp.rs:26-36 prior to this lane) and a single
 /// `{:?}` in a log line would leak the credential — pinned by
@@ -387,7 +404,7 @@ impl SftpPlugin {
             ip: info.ip.clone(),
             port: info.port,
             user: info.user.clone(),
-            path: info.path.clone(),
+            path: info.mount_root().to_string_lossy().into_owned(),
             mount_point: mp.clone(),
         };
         // Transition to Mounting FIRST so a concurrent mount request sees
@@ -1470,6 +1487,23 @@ mod tests {
         assert!(argv_str
             .windows(2)
             .any(|w| w[0] == "-o" && w[1] == "password_stdin"));
+    }
+
+    #[tokio::test]
+    async fn every_mount_holds_all_the_storage_the_phone_lists() {
+        let runner = ScriptedRunner::always_succeed();
+        let argv_log = runner.argv_log.clone();
+        let (plugin, _d) = test_plugin_with_runner(runner);
+        let mut info = sample_info();
+        info.multi_paths.push("/storage/ABCD-1234".to_string());
+        plugin
+            .mount_device("dev1", &info)
+            .await
+            .expect("mount call");
+        let argv = argv_log.lock().unwrap();
+        assert!(argv[0]
+            .iter()
+            .any(|arg| arg.to_string_lossy() == "kdeconnect@192.168.1.50:/storage"));
     }
 
     #[tokio::test]
