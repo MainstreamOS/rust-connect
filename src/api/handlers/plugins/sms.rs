@@ -75,8 +75,7 @@ pub async fn get_sms_threads(
 
     let all_threads = state.plugins.sms.get_threads(&device_id);
     let total = all_threads.len();
-    let start = (page.saturating_sub(1)) * limit;
-    let _end = start.saturating_add(limit).min(total);
+    let start = crate::api::types::Pagination::offset(page, limit);
     let threads: Vec<_> = all_threads.into_iter().skip(start).take(limit).collect();
 
     Ok(Json(ApiResponse::ok(SmsThreadsResponse {

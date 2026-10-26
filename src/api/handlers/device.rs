@@ -57,9 +57,8 @@ pub(crate) async fn render_device_list(
     let devices = state.registry.list().await;
     let total = devices.len();
     // The registry can shrink between a client's page requests — an
-    // out-of-range page must return empty, not panic the slice. Saturating
-    // mul: page/limit are user-controlled, ordinary mul can overflow.
-    let start = page.saturating_sub(1).saturating_mul(limit).min(total);
+    // out-of-range page must return empty, not panic the slice.
+    let start = crate::api::types::Pagination::offset(page, limit).min(total);
     let end = start.saturating_add(limit).min(total);
     let mut page_devices: Vec<DeviceSummary> = Vec::with_capacity(end - start);
     for device in &devices[start..end] {

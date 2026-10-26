@@ -95,8 +95,7 @@ pub async fn get_notifications(
         .get_history(device_id, usize::MAX);
     all_entries.reverse();
     let total = all_entries.len();
-    let start = (page.saturating_sub(1)) * limit;
-    let _end = start.saturating_add(limit).min(total);
+    let start = crate::api::types::Pagination::offset(page, limit);
     let entries: Vec<_> = all_entries.into_iter().skip(start).take(limit).collect();
 
     Ok(Json(ApiResponse::ok(NotificationsListResponse {

@@ -251,6 +251,12 @@ impl Pagination {
     pub fn limit(&self) -> usize {
         self.limit.unwrap_or(Self::DEFAULT_LIMIT)
     }
+
+    /// Items before the page. Page and limit come from the client, so this
+    /// saturates: a page past the end is empty, never an overflow.
+    pub fn offset(page: usize, limit: usize) -> usize {
+        page.saturating_sub(1).saturating_mul(limit)
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

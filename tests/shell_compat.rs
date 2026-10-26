@@ -2610,3 +2610,26 @@ async fn a_missing_pin_does_not_let_another_certificate_act_as_the_paired_phone(
         "a never-approved certificate was treated as the paired phone"
     );
 }
+
+#[tokio::test]
+async fn huge_page_numbers_return_an_empty_page() {
+    use tower::ServiceExt;
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    for path in [
+        format!("/api/v1/devices/{PHONE}/sms/threads"),
+        "/api/v1/notifications".to_string(),
+    ] {
+        let request = axum::http::Request::builder()
+            .uri(format!("{path}?page={}&limit=2", usize::MAX))
+            .header("X-API-Key", "private-bus-test")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let router = rust_connect::api::build_router(app.clone());
+        let response = tokio::spawn(async move { router.oneshot(request).await })
+            .await
+            .expect("the request must not panic")
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+    }
+}
