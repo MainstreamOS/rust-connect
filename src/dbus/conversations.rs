@@ -192,6 +192,12 @@ impl Conversations {
     }
     #[zbus(name = "requestAllConversationThreads")]
     async fn all(&self) -> zbus::fdo::Result<()> {
+        self.context.require_device(&self.device).await?;
+        self.context
+            .app
+            .plugins
+            .sms
+            .begin_conversation_refresh(&self.device);
         self.context
             .send(
                 &self.device,
@@ -401,6 +407,9 @@ impl Conversations {
         thread: i64,
         count: u64,
     ) -> zbus::Result<()>;
+    /// A new list is starting, not a claim that unlisted histories were deleted.
+    #[zbus(signal, name = "conversationListReset")]
+    pub async fn list_reset(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
     #[zbus(signal, name = "conversationRemoved")]
     pub async fn removed(
         emitter: &zbus::object_server::SignalEmitter<'_>,

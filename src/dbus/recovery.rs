@@ -23,6 +23,15 @@ impl Context {
         current
     }
     async fn synchronize_messages(&self, device: &str) -> zbus::Result<()> {
+        // The reset itself may have been dropped with a lagged event burst.
+        // Rebuild the visible list, while preserving the client's histories.
+        self.emit(
+            device,
+            "org.kde.kdeconnect.device.conversations",
+            "conversationListReset",
+            &(),
+        )
+        .await?;
         let known = self
             .known_threads
             .lock()

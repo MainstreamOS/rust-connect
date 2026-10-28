@@ -269,6 +269,15 @@ impl Context {
     }
     async fn plugin_event(self: &Arc<Self>, event: PluginEvent) -> zbus::Result<()> {
         match event {
+            PluginEvent::SmsConversationListReset { device_id } => {
+                self.emit(
+                    &device_id,
+                    "org.kde.kdeconnect.device.conversations",
+                    "conversationListReset",
+                    &(),
+                )
+                .await?;
+            }
             PluginEvent::SmsMessagesReceived {
                 device_id,
                 messages,

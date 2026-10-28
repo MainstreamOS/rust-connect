@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Phone file browsing allows up to 30 seconds for fresh credentials when
+  reconnect synchronization delays the phone's reply, and reports the phone's
+  storage-permission error instead of hiding it behind a timeout. The phone's
+  startup server-status announcement no longer overwrites real credentials.
+- A conversation refresh starts a fresh list while retaining saved histories.
+  Shell clients can follow the `conversationListReset` D-Bus signal to stop
+  deleted conversations returning from their cache. Partial lists and empty
+  message packets never cause deletion signals; late conversations still appear.
+
 ### Changed
 
 - An mDNS resolve now answers with our UDP identity to the resolved

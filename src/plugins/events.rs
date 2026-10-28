@@ -56,6 +56,14 @@ pub enum PluginEvent {
         /// Server-determined path; `None` when nothing is mounted.
         mount_point: Option<String>,
     },
+    SftpError {
+        device_id: String,
+        error: String,
+    },
+    /// A new conversation listing is starting; cached histories remain available.
+    SmsConversationListReset {
+        device_id: String,
+    },
     RemoteKeyboardEcho {
         device_id: String,
         /// Absent when the peer sent a malformed echo. kdeconnect-kde drops

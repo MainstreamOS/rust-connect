@@ -2,7 +2,7 @@
 //!
 //! Single Responsibility: Handle kdeconnect.sms packets.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 
@@ -78,6 +78,7 @@ pub struct SmsMessagePayload {
 #[derive(Clone)]
 pub struct SmsPlugin {
     threads: Arc<StdRwLock<SmsThreadStore>>,
+    listed_threads: Arc<StdRwLock<HashMap<String, HashSet<i64>>>>,
     runtime: Option<SmsRuntime>,
 }
 
@@ -192,6 +193,7 @@ impl SmsPlugin {
     pub fn new() -> Self {
         Self {
             threads: Arc::new(StdRwLock::new(HashMap::new())),
+            listed_threads: Arc::new(StdRwLock::new(HashMap::new())),
             runtime: None,
         }
     }
@@ -423,12 +425,36 @@ impl SmsPlugin {
         Ok(())
     }
 
-    pub fn thread_ids(&self, device: &str) -> std::collections::HashSet<i64> {
+    /// Start a new *view* of the list, retaining cached histories. Android
+    /// @ bc38ff62, SMSPlugin.kt:214-225 sends one packet per thread with no end marker;
+    /// absence is never evidence of deletion. Late replies remain welcome.
+    pub fn begin_conversation_refresh(&self, device: &str) {
+        self.listed_threads
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device.into(), HashSet::new());
+        if let Some(runtime) = &self.runtime {
+            runtime
+                .events
+                .broadcast(super::PluginEvent::SmsConversationListReset {
+                    device_id: device.into(),
+                });
+        }
+    }
+
+    pub fn thread_ids(&self, device: &str) -> HashSet<i64> {
+        let listed = self
+            .listed_threads
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         self.threads
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .keys()
-            .filter_map(|(id, thread)| (id == device).then_some(*thread))
+            .filter_map(|(id, thread)| {
+                (id == device && listed.get(device).is_some_and(|ids| ids.contains(thread)))
+                    .then_some(*thread)
+            })
             .collect()
     }
     pub fn latest_message(&self, device: &str, thread: i64) -> Option<SmsMessage> {
@@ -441,10 +467,11 @@ impl SmsPlugin {
 
     #[allow(clippy::expect_used)]
     pub fn get_threads(&self, device_id: &str) -> Vec<SmsThread> {
+        let listed = self.thread_ids(device_id);
         let threads = self.threads.read().unwrap_or_else(|e| e.into_inner());
         threads
             .iter()
-            .filter(|((did, _), _)| did == device_id)
+            .filter(|((did, tid), _)| did == device_id && listed.contains(tid))
             .map(|((_, thread_id), msgs)| {
                 let read_count = msgs.len();
                 let addresses = msgs
@@ -495,7 +522,8 @@ impl Plugin for SmsPlugin {
         ]
     }
 
-    fn on_connected(&self, _device_id: &str) -> Vec<Packet> {
+    fn on_connected(&self, device_id: &str) -> Vec<Packet> {
+        self.begin_conversation_refresh(device_id);
         vec![Packet::new(
             "kdeconnect.sms.request_conversations".to_string(),
             serde_json::json!({}),
@@ -509,6 +537,10 @@ impl Plugin for SmsPlugin {
         if let Ok(mut threads) = self.threads.write() {
             threads.retain(|(did, _), _| did != device_id);
         }
+        self.listed_threads
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id);
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
@@ -601,6 +633,27 @@ impl Plugin for SmsPlugin {
             }
         }
 
+        {
+            let stored: HashSet<_> = self
+                .threads
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .filter_map(|(owner, tid)| (owner == device_id).then_some(*tid))
+                .collect();
+            let mut listed = self
+                .listed_threads
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let ids = listed.entry(device_id.into()).or_default();
+            ids.extend(
+                changed
+                    .iter()
+                    .map(|(message, _)| message.thread_id.unwrap_or(0)),
+            );
+            ids.retain(|tid| stored.contains(tid));
+        }
+
         if let Some(runtime) = &self.runtime {
             let created_threads = changed
                 .iter()
@@ -624,6 +677,39 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+
+    #[tokio::test]
+    async fn a_fresh_listing_does_not_merge_old_threads_or_destroy_their_history() {
+        let plugin = SmsPlugin::new();
+        let batch = |ids: &[i64]| {
+            Packet::new(
+                "kdeconnect.sms.messages".into(),
+                serde_json::json!({"messages": ids.iter().map(|id| serde_json::json!({
+                "threadID": id, "_id":id, "date":id, "body":"saved history"
+            })).collect::<Vec<_>>() }),
+            )
+        };
+        plugin
+            .handle_packet("phone", batch(&[1, 2, 3]))
+            .await
+            .unwrap();
+        plugin.handle_packet("other", batch(&[4])).await.unwrap();
+        plugin.begin_conversation_refresh("phone");
+        assert!(plugin.get_threads("phone").is_empty());
+        assert_eq!(plugin.get_thread("phone", 1).len(), 1);
+        assert_eq!(plugin.thread_ids("other"), HashSet::from([4]));
+        plugin.handle_packet("phone", batch(&[2])).await.unwrap();
+        assert_eq!(plugin.thread_ids("phone"), HashSet::from([2]));
+        // Empty or partial batches have no deletion/completion meaning.
+        plugin.handle_packet("phone", batch(&[])).await.unwrap();
+        plugin.handle_packet("phone", batch(&[1])).await.unwrap();
+        assert_eq!(plugin.thread_ids("phone"), HashSet::from([1, 2]));
+        assert_eq!(plugin.get_thread("phone", 3).len(), 1);
+        plugin.begin_conversation_refresh("phone");
+        assert!(plugin.get_threads("phone").is_empty());
+        plugin.handle_packet("phone", batch(&[3])).await.unwrap();
+        assert_eq!(plugin.get_threads("phone")[0].thread_id, 3);
+    }
 
     #[tokio::test]
     async fn the_cache_trim_never_takes_a_folder_that_is_still_downloading() {

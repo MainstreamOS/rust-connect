@@ -1169,6 +1169,11 @@ async fn check_python_bridge(
     app: &AppState,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    // The loopback TLS fixture does not run the daemon's lifecycle loop.
+    // Give the bridge the connected state an actual phone has.
+    let mut device = app.registry.get(&PHONE.into()).await.unwrap();
+    device.state = rust_connect::device::DeviceState::Connected;
+    app.registry.update(device).await.unwrap();
     let mut child = tokio::process::Command::new("python3")
         .arg(script)
         .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
@@ -1189,6 +1194,7 @@ async fn check_python_bridge(
         event["devices"][0]["id"],
         "phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     );
+    assert_eq!(event["devices"][0]["reachable"], true);
     input
         .write_all(b"{\"cmd\":\"conversations\",\"device\":\"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n")
         .await
@@ -2135,6 +2141,7 @@ async fn a_reconnect_burst_does_not_report_conversations_as_removed() {
     .await
     .unwrap();
     let mut removed = proxy.receive_signal("conversationRemoved").await.unwrap();
+    let mut resets = proxy.receive_signal("conversationListReset").await.unwrap();
     let mut loaded = proxy.receive_signal("conversationLoaded").await.unwrap();
     let batch = |thread: i64| {
         Packet::new(
@@ -2154,6 +2161,30 @@ async fn a_reconnect_burst_does_not_report_conversations_as_removed() {
             .unwrap()
             .unwrap();
     }
+    app.plugins.sms.begin_conversation_refresh(PHONE);
+    tokio::time::timeout(Duration::from_secs(3), resets.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let active: Vec<zbus::zvariant::OwnedValue> =
+        proxy.call("activeConversations", &()).await.unwrap();
+    assert!(
+        active.is_empty(),
+        "a fresh list must not merge cached conversations"
+    );
+    assert_eq!(app.plugins.sms.get_thread(PHONE, 1).len(), 1);
+    app.plugins
+        .sms
+        .handle_packet(PHONE, batch(2))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), loaded.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let active: Vec<zbus::zvariant::OwnedValue> =
+        proxy.call("activeConversations", &()).await.unwrap();
+    assert_eq!(active.len(), 1);
     // A reconnect clears the phone's threads, and the first packet back holds one.
     app.plugins.sms.on_disconnected(PHONE).await;
     app.plugins

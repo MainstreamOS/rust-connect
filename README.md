@@ -51,6 +51,13 @@ For Mainstream's Phone tab and Dynamic Island, the optional
 activation after the source install. See the [compatibility and cutover guide](docs/mainstream-shell-compatibility.md)
 for the supported interfaces, remaining dependencies and device acceptance checks.
 
+Phone file browsing can take up to 40 seconds during reconnect synchronization
+(30 seconds for credentials, then 10 seconds to mount). Conversation refreshes
+rebuild the visible list from the phone while keeping cached message histories;
+`conversationListReset` tells shell clients to replace their previous list.
+Android does not send a conversation-list completion marker, so a missing
+thread is never reported as definitively deleted and late replies remain valid.
+
 Builds a release binary into `~/.local/bin`, installs the unit to
 `~/.config/systemd/user/`, and enables it. Re-run it to upgrade. Then:
 

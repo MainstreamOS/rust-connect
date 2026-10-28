@@ -99,6 +99,8 @@ fn kind(event: &ServerEvent) -> &'static str {
             PluginEvent::TelephonyUpdate { .. } => "plugin.telephony_update",
             PluginEvent::ClipboardUpdate { .. } => "plugin.clipboard_update",
             PluginEvent::SftpUpdate { .. } => "plugin.sftp_update",
+            PluginEvent::SftpError { .. } => "plugin.sftp_error",
+            PluginEvent::SmsConversationListReset { .. } => "plugin.sms_conversation_list_reset",
             PluginEvent::RemoteKeyboardEcho { .. } => "plugin.remote_keyboard_echo",
             PluginEvent::RemoteKeyboardState { .. } => "plugin.remote_keyboard_state",
             PluginEvent::RemoteCommandsUpdate { .. } => "plugin.remote_commands_update",

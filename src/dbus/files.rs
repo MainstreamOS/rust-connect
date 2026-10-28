@@ -170,6 +170,8 @@ pub(crate) struct Sftp {
     pub device: String,
 }
 
+const CREDENTIALS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn wait_for_sftp_credentials(
     mut events: tokio::sync::broadcast::Receiver<PluginEvent>,
     device: &str,
@@ -182,6 +184,9 @@ async fn wait_for_sftp_credentials(
                 mounted: false,
                 ..
             }) if device_id == device => return Ok(()),
+            Ok(PluginEvent::SftpError { device_id, error }) if device_id == device => {
+                return Err(failure(error));
+            }
             Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(_) => return Err(failure("Phone file-browsing updates stopped")),
         }
@@ -217,7 +222,10 @@ impl Sftp {
             .send(&self.device, plugin.request_sftp(&self.device))
             .await?;
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            // A reconnect can queue the reply behind contacts and SMS sync.
+            // A live Android 1.37 phone took 16.6 s to answer this request.
+            // The caller must allow this plus the 10 s sshfs mount budget.
+            CREDENTIALS_TIMEOUT,
             wait_for_sftp_credentials(updates, &self.device),
         )
         .await
@@ -334,5 +342,38 @@ mod tests {
         let (sender, receiver) = tokio::sync::broadcast::channel(1);
         drop(sender);
         assert!(wait_for_sftp_credentials(receiver, "phone").await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credentials_can_arrive_after_a_reconnect_sync_burst() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(17)).await;
+            sender.send(credentials("phone")).unwrap();
+        });
+        tokio::time::timeout(
+            CREDENTIALS_TIMEOUT,
+            wait_for_sftp_credentials(receiver, "phone"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn credentials_report_the_requested_phones_storage_error() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        for device in ["other-phone", "phone"] {
+            sender
+                .send(PluginEvent::SftpError {
+                    device_id: device.into(),
+                    error: "Allow filesystem access on your phone".into(),
+                })
+                .unwrap();
+        }
+        let error = wait_for_sftp_credentials(receiver, "phone")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Allow filesystem access"));
     }
 }

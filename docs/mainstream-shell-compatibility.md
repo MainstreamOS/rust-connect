@@ -106,6 +106,27 @@ and local island panels are independent of this backend.
 
 ## Validation and remaining device acceptance
 
+Conversation listings and histories are separate. On connect or an explicit
+`requestAllConversationThreads`, `conversationListReset` starts a new visible
+list. Clients replace their list from `activeConversations` and add subsequent
+`conversationCreated` / `conversationUpdated` signals, retaining cached histories
+separately. Do not merge every saved history back into an online list. Preserve
+the last visible thread IDs with the offline cache so a shell restart does not
+bring old conversations back. Event recovery repeats the reset and current list.
+This is a refresh, not an authoritative deletion notification: Android
+[`SMSPlugin.kt:214-225`](https://invent.kde.org/network/kdeconnect-android/-/blob/bc38ff624f2674a10fc8c9392d7d058f7ced6f6f/src/main/java/org/kde/kdeconnect/plugins/sms/SMSPlugin.kt#L214-225)
+has no list-completion marker, and an empty message batch is also sent by live
+database updates. A delayed thread must remain able to reappear. Individual
+message deletions within a retained conversation are not inferred by this refresh.
+
+Allow 60 seconds for `mountAndWait`: it can join an existing mount for 15 seconds,
+wait 30 seconds for fresh phone credentials, then mount for up to 10 seconds.
+Android's
+[`SftpPlugin.kt:73-94`](https://invent.kde.org/network/kdeconnect-android/-/blob/bc38ff624f2674a10fc8c9392d7d058f7ced6f6f/src/main/java/org/kde/kdeconnect/plugins/sftp/SftpPlugin.kt#L73-94)
+announces `serverRunning:false` without credentials and sends `errorMessage`
+for missing storage permissions; the former is ignored as a credential update
+and the latter fails the pending mount with the phone's actual explanation.
+
 Run the private-bus integration tests without a real phone:
 
 ```sh

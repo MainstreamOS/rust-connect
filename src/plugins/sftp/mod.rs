@@ -886,13 +886,24 @@ impl Plugin for SftpPlugin {
             return Ok(None);
         }
 
-        if let Some(error_msg) = packet.body.get("errorMessage") {
+        if let Some(error_msg) = packet.body.get("errorMessage").and_then(|v| v.as_str()) {
+            let error: String = error_msg.chars().take(512).collect();
             info!(
                 device_id = %device_id,
-                error = %error_msg,
+                error = %error,
                 event = "sftp_error",
                 "SFTP error from device"
             );
+            self.plugin_events.broadcast(PluginEvent::SftpError {
+                device_id: device_id.into(),
+                error,
+            });
+            return Ok(None);
+        }
+
+        // Android @ bc38ff62, SftpPlugin.kt:73-77 announces serverRunning:false at
+        // plugin startup, without credentials. It is not a browsing reply.
+        if packet.body.get("serverRunning").and_then(|v| v.as_bool()) == Some(false) {
             return Ok(None);
         }
 
@@ -1871,6 +1882,7 @@ mod tests {
     #[tokio::test]
     async fn handle_sftp_error_does_not_store() {
         let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+        let mut updates = plugin.plugin_events.subscribe();
         let packet = Packet::new(
             "kdeconnect.sftp".to_string(),
             serde_json::json!({
@@ -1879,6 +1891,27 @@ mod tests {
         );
         assert!(plugin.handle_packet("device1", packet).await.is_ok());
         assert!(plugin.get_connection("device1").is_none());
+        assert!(
+            matches!(updates.recv().await.unwrap(), PluginEvent::SftpError { device_id, error }
+            if device_id == "device1" && error == "No storage locations configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_server_status_does_not_replace_browsing_credentials() {
+        let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+        let status = || {
+            Packet::new(
+                "kdeconnect.sftp".into(),
+                serde_json::json!({"serverRunning":false}),
+            )
+        };
+        plugin.handle_packet("phone", status()).await.unwrap();
+        assert!(plugin.get_connection("phone").is_none());
+        plugin.handle_packet("phone", Packet::new("kdeconnect.sftp".into(),
+            serde_json::json!({"port":1739,"user":"kdeconnect","password":"fresh","path":"/storage/emulated/0"}))).await.unwrap();
+        plugin.handle_packet("phone", status()).await.unwrap();
+        assert_eq!(plugin.get_connection("phone").unwrap().password, "fresh");
     }
 
     #[test]
