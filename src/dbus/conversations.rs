@@ -169,6 +169,31 @@ pub(crate) struct Conversations {
 }
 #[interface(name = "org.kde.kdeconnect.device.conversations")]
 impl Conversations {
+    /// Delete cached desktop copies while retaining a cutoff against replay.
+    #[zbus(name = "forgetConversations")]
+    async fn forget(&self, threads: Vec<i64>) -> zbus::fdo::Result<i64> {
+        if !self
+            .context
+            .app
+            .pairing_handler
+            .is_paired(&self.device)
+            .await
+        {
+            return Err(failure("Phone is not paired"));
+        }
+        self.context
+            .app
+            .plugins
+            .sms
+            .forget_conversations(&self.device, threads)
+            .await
+            .map_err(failure)
+    }
+
+    #[zbus(name = "deletionCutoffs")]
+    fn deletion_cutoffs(&self) -> std::collections::HashMap<i64, i64> {
+        self.context.app.plugins.sms.deletion_cutoffs(&self.device)
+    }
     #[zbus(name = "activeConversations")]
     async fn active(&self) -> zbus::fdo::Result<Vec<OwnedValue>> {
         let mut result = Vec::new();
@@ -213,6 +238,11 @@ impl Conversations {
         if start < 0 || end < start || end > 500 {
             return Err(failure("Invalid history range (maximum 500 messages)"));
         }
+        self.context
+            .app
+            .plugins
+            .sms
+            .begin_history_request(&self.device);
         {
             let mut watched = self.context.watched_threads.lock().await;
             if watched
@@ -410,6 +440,12 @@ impl Conversations {
     /// A new list is starting, not a claim that unlisted histories were deleted.
     #[zbus(signal, name = "conversationListReset")]
     pub async fn list_reset(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+    /// A new incoming phone record; history requests and recovery never emit it.
+    #[zbus(signal, name = "messageReceived")]
+    pub async fn message_received(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        message: OwnedValue,
+    ) -> zbus::Result<()>;
     #[zbus(signal, name = "conversationRemoved")]
     pub async fn removed(
         emitter: &zbus::object_server::SignalEmitter<'_>,
@@ -445,6 +481,11 @@ pub(crate) struct Sms {
 impl Sms {
     #[zbus(name = "requestAllConversations")]
     async fn all(&self) -> zbus::fdo::Result<()> {
+        self.context
+            .app
+            .plugins
+            .sms
+            .begin_conversation_refresh(&self.device);
         self.context
             .send(
                 &self.device,

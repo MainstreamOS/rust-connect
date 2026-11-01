@@ -108,6 +108,7 @@ pub async fn request_sms_threads(
     validate_device_id(&device_id).map_err(api_err)?;
 
     let packet = conversations_request_packet();
+    state.plugins.sms.begin_conversation_refresh(&device_id);
     state
         .connection_manager
         .send_packet(&device_id, &packet)

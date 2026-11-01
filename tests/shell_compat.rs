@@ -2168,9 +2168,10 @@ async fn a_reconnect_burst_does_not_report_conversations_as_removed() {
         .unwrap();
     let active: Vec<zbus::zvariant::OwnedValue> =
         proxy.call("activeConversations", &()).await.unwrap();
-    assert!(
-        active.is_empty(),
-        "a fresh list must not merge cached conversations"
+    assert_eq!(
+        active.len(),
+        3,
+        "a refresh keeps the last list while replies arrive"
     );
     assert_eq!(app.plugins.sms.get_thread(PHONE, 1).len(), 1);
     app.plugins
@@ -2184,8 +2185,8 @@ async fn a_reconnect_burst_does_not_report_conversations_as_removed() {
         .unwrap();
     let active: Vec<zbus::zvariant::OwnedValue> =
         proxy.call("activeConversations", &()).await.unwrap();
-    assert_eq!(active.len(), 1);
-    // A reconnect clears the phone's threads, and the first packet back holds one.
+    assert_eq!(active.len(), 3);
+    // A reconnect retains the phone's threads while the first packet back holds one.
     app.plugins.sms.on_disconnected(PHONE).await;
     app.plugins
         .sms
@@ -2248,8 +2249,7 @@ async fn cached_attachments_keep_readable_names_and_old_copies_are_still_found()
     let legacy = directory.join(rust_connect::plugins::sms::attachment_filename("PART_old"));
     std::fs::write(&legacy, b"old").unwrap();
     assert_eq!(sms.attachment_path(PHONE, "PART_old").unwrap(), legacy);
-    // A copy cached with its extension is still found once a reconnect has
-    // cleared the message that gave its type.
+    // A copy cached with its extension is still found after a reconnect.
     std::fs::write(&path, b"new").unwrap();
     sms.on_disconnected(PHONE).await;
     assert_eq!(
@@ -2963,4 +2963,194 @@ async fn the_contact_mirror_recovers_after_a_failed_write() {
         recovered.is_ok(),
         "the mirror never retried its failed write"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_history_deletion_survives_replay_restart_and_preserves_other_threads() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = paired_state(temp.path()).await;
+    let packet = |thread: i64, date: i64, identifier: &str| {
+        Packet::new(
+            "kdeconnect.sms.messages".into(),
+            serde_json::json!({"messages":[{"thread_id":thread,"_id":thread,"date":date,"type":1,"body":"fixture",
+            "attachments":[{"part_id":1,"mime_type":"image/jpeg","unique_identifier":identifier}]}]}),
+        )
+    };
+    for (thread, identifier) in [(1, "removed"), (2, "kept")] {
+        app.plugins
+            .sms
+            .handle_packet(PHONE, packet(thread, 10, identifier))
+            .await
+            .unwrap();
+        let path = app.plugins.sms.attachment_path(PHONE, identifier).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"fixture media").unwrap();
+    }
+    app.plugins
+        .sms
+        .handle_packet("other-phone", packet(1, 10, "other"))
+        .await
+        .unwrap();
+    let removed = app.plugins.sms.attachment_path(PHONE, "removed").unwrap();
+    let kept = app.plugins.sms.attachment_path(PHONE, "kept").unwrap();
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let client = bus.connect(None).await;
+    let proxy = zbus::Proxy::new(
+        &client,
+        "org.kde.kdeconnect",
+        "/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "org.kde.kdeconnect.device.conversations",
+    )
+    .await
+    .unwrap();
+    let before: i64 = proxy
+        .call("forgetConversations", &(vec![1i64],))
+        .await
+        .unwrap();
+    assert!(before > 10);
+    assert!(app.plugins.sms.get_thread(PHONE, 1).is_empty());
+    assert_eq!(app.plugins.sms.get_thread(PHONE, 2).len(), 1);
+    assert_eq!(app.plugins.sms.get_thread("other-phone", 1).len(), 1);
+    assert!(!removed.exists());
+    assert!(kept.exists());
+    let cutoffs: HashMap<i64, i64> = proxy.call("deletionCutoffs", &()).await.unwrap();
+    assert_eq!(cutoffs.get(&1), Some(&before));
+    app.plugins
+        .sms
+        .handle_packet(PHONE, packet(1, 10, "removed"))
+        .await
+        .unwrap();
+    assert!(app.plugins.sms.get_thread(PHONE, 1).is_empty());
+    app.plugins.sms.on_disconnected(PHONE).await;
+    app.plugins.sms.on_connected(PHONE);
+    app.plugins
+        .sms
+        .handle_packet(PHONE, packet(1, before, "removed"))
+        .await
+        .unwrap();
+    assert!(app.plugins.sms.get_thread(PHONE, 1).is_empty());
+    service.stop().await;
+    let restarted = state(temp.path()).await;
+    restarted
+        .plugins
+        .sms
+        .handle_packet(PHONE, packet(1, 10, "removed"))
+        .await
+        .unwrap();
+    assert!(restarted.plugins.sms.get_thread(PHONE, 1).is_empty());
+    restarted
+        .plugins
+        .sms
+        .handle_packet(PHONE, packet(1, before + 1, "new"))
+        .await
+        .unwrap();
+    assert_eq!(restarted.plugins.sms.get_thread(PHONE, 1).len(), 1);
+    assert_eq!(
+        restarted.plugins.sms.get_thread(PHONE, 1)[0].date,
+        Some(before + 1)
+    );
+    restarted
+        .plugins
+        .sms
+        .handle_packet(
+            PHONE,
+            Packet::new(
+                "kdeconnect.sms.messages".into(),
+                serde_json::json!({"messages":[{"thread_id":1,"_id":1,"read":1}]}),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restarted.plugins.sms.get_thread(PHONE, 1)[0].read, Some(1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_and_reconnect_replays_do_not_emit_new_incoming_messages() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = paired_state(temp.path()).await;
+    let service = DBusService::on_connection(
+        app.clone(),
+        bus.connect(Some("org.kde.kdeconnect")).await,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let client = bus.connect(None).await;
+    let proxy = zbus::Proxy::new(
+        &client,
+        "org.kde.kdeconnect",
+        "/modules/kdeconnect/devices/phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "org.kde.kdeconnect.device.conversations",
+    )
+    .await
+    .unwrap();
+    let mut received = proxy.receive_signal("messageReceived").await.unwrap();
+    let mut loaded = proxy.receive_signal("conversationLoaded").await.unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let packet = |uid: i64, date: i64| {
+        Packet::new(
+            "kdeconnect.sms.messages".into(),
+            serde_json::json!({"messages":[{"thread_id":1,"_id":uid,"date":date,"type":1,"body":"fixture"}]}),
+        )
+    };
+    app.plugins.sms.begin_conversation_refresh(PHONE);
+    app.plugins
+        .sms
+        .handle_packet(PHONE, packet(1, now - 10000))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), loaded.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), received.next())
+            .await
+            .is_err()
+    );
+    app.plugins
+        .sms
+        .handle_packet(PHONE, packet(2, now + 1000))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), received.next())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), loaded.next())
+        .await
+        .unwrap()
+        .unwrap();
+    app.plugins.sms.on_disconnected(PHONE).await;
+    app.plugins.sms.on_connected(PHONE);
+    app.plugins
+        .sms
+        .handle_packet(PHONE, packet(2, now + 1000))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), loaded.next())
+        .await
+        .unwrap()
+        .unwrap();
+    // An offline history request still replays its cache, but cannot announce it as new.
+    assert!(proxy
+        .call::<_, _, ()>("requestConversation", &(1i64, 0i32, 50i32))
+        .await
+        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), received.next())
+            .await
+            .is_err()
+    );
+    service.stop().await;
 }

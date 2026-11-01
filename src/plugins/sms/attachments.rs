@@ -34,6 +34,7 @@ struct Pending {
     requested: bool,
     cancelled: CancellationToken,
     response: Option<oneshot::Sender<Packet>>,
+    finished: CancellationToken,
 }
 pub(super) struct AttachmentQueue {
     slots: Arc<Semaphore>,
@@ -58,6 +59,30 @@ impl AttachmentQueue {
                 job.cancelled.cancel();
             }
         }
+    }
+    pub(super) async fn forget(
+        &self,
+        device: &str,
+        identifiers: &std::collections::HashSet<String>,
+    ) {
+        let finished: Vec<_> = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((owner, identifier), _)| owner == device && identifiers.contains(identifier))
+            .map(|(_, job)| {
+                job.cancelled.cancel();
+                job.finished.clone()
+            })
+            .collect();
+        for token in finished {
+            token.cancelled().await;
+        }
+        self.results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(owner, identifier), _| owner != device || !identifiers.contains(identifier));
     }
     pub(super) fn deliver(&self, device: &str, packet: Packet) -> Result<()> {
         let identifier = packet
@@ -166,6 +191,7 @@ impl SmsPlugin {
         })?;
         let serial = queue.sequence.fetch_add(1, Ordering::Relaxed);
         let cancelled = CancellationToken::new();
+        let finished = CancellationToken::new();
         let (response, receiver) = oneshot::channel();
         jobs.insert(
             key.clone(),
@@ -174,6 +200,7 @@ impl SmsPlugin {
                 requested: false,
                 cancelled: cancelled.clone(),
                 response: Some(response),
+                finished: finished.clone(),
             },
         );
         drop(jobs);
@@ -188,6 +215,7 @@ impl SmsPlugin {
                 result=tokio::time::timeout(std::time::Duration::from_secs(300),work)=>result.unwrap_or_else(|_|Err(Error::ConnectionTimeout("SMS attachment download timed out".into()))),
             };
             runtime.attachments.finish(&runtime, key, serial, result);
+            finished.cancel();
         });
         Ok(())
     }

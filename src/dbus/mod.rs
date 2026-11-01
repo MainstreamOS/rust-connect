@@ -282,6 +282,7 @@ impl Context {
                 device_id,
                 messages,
                 created_threads,
+                live_messages,
             } => {
                 self.register(&device_id).await?;
                 let mut created: HashSet<_> = created_threads.into_iter().collect();
@@ -296,6 +297,14 @@ impl Context {
                     };
                     if let Err(error) = self.message_signal(&device_id, signal, &message).await {
                         tracing::warn!(%error, "Could not publish conversation message");
+                    }
+                    if message
+                        .uid
+                        .or(message.message_id)
+                        .is_some_and(|uid| live_messages.contains(&(thread, uid)))
+                    {
+                        self.message_signal(&device_id, "messageReceived", &message)
+                            .await?;
                     }
                 }
                 self.remember_threads(&device_id).await;

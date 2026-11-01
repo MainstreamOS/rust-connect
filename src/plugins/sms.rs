@@ -13,6 +13,7 @@ use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
 mod attachments;
+mod deletions;
 pub use attachments::{request_packet as attachment_request_packet, AttachmentResult};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -61,6 +62,14 @@ pub struct SmsThread {
 
 type SmsThreadStore = HashMap<ThreadKey, Vec<SmsMessage>>;
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 /// Caps on peer-fed SMS state (2026-09-02 audit, B5): thread ids are
 /// peer-controlled, so both the thread count per device and the messages
 /// per thread are bounded, oldest out.
@@ -79,6 +88,8 @@ pub struct SmsMessagePayload {
 pub struct SmsPlugin {
     threads: Arc<StdRwLock<SmsThreadStore>>,
     listed_threads: Arc<StdRwLock<HashMap<String, HashSet<i64>>>>,
+    deletions: Arc<StdRwLock<deletions::Deletions>>,
+    live_after: Arc<StdRwLock<HashMap<String, i64>>>,
     runtime: Option<SmsRuntime>,
 }
 
@@ -194,6 +205,8 @@ impl SmsPlugin {
         Self {
             threads: Arc::new(StdRwLock::new(HashMap::new())),
             listed_threads: Arc::new(StdRwLock::new(HashMap::new())),
+            deletions: Arc::new(StdRwLock::new(deletions::Deletions::default())),
+            live_after: Arc::new(StdRwLock::new(HashMap::new())),
             runtime: None,
         }
     }
@@ -205,6 +218,9 @@ impl SmsPlugin {
         certificates: Arc<crate::protocol::CertificateManager>,
         cache: PathBuf,
     ) -> Self {
+        self.deletions = Arc::new(StdRwLock::new(deletions::Deletions::load(
+            cache.join("deleted-conversations.json"),
+        )));
         self.runtime = Some(SmsRuntime {
             events,
             connections,
@@ -217,6 +233,18 @@ impl SmsPlugin {
 
     /// Delete a revoked phone's cached attachments.
     pub async fn forget_attachments(&self, device: &str) {
+        self.threads
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(owner, _), _| owner != device);
+        self.listed_threads
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device);
+        self.live_after
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device);
         if let Some(runtime) = &self.runtime {
             runtime.attachments.cancel_device(device);
             let _ =
@@ -425,14 +453,10 @@ impl SmsPlugin {
         Ok(())
     }
 
-    /// Start a new *view* of the list, retaining cached histories. Android
-    /// @ bc38ff62, SMSPlugin.kt:214-225 sends one packet per thread with no end marker;
-    /// absence is never evidence of deletion. Late replies remain welcome.
+    /// Android sends one packet per thread with no end marker. Keep the last
+    /// list visible while replies arrive; absence cannot establish deletion.
     pub fn begin_conversation_refresh(&self, device: &str) {
-        self.listed_threads
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(device.into(), HashSet::new());
+        self.begin_history_request(device);
         if let Some(runtime) = &self.runtime {
             runtime
                 .events
@@ -440,6 +464,13 @@ impl SmsPlugin {
                     device_id: device.into(),
                 });
         }
+    }
+
+    pub fn begin_history_request(&self, device: &str) {
+        self.live_after
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device.into(), now_ms());
     }
 
     pub fn thread_ids(&self, device: &str) -> HashSet<i64> {
@@ -534,13 +565,8 @@ impl Plugin for SmsPlugin {
         if let Some(runtime) = &self.runtime {
             runtime.attachments.cancel_device(device_id);
         }
-        if let Ok(mut threads) = self.threads.write() {
-            threads.retain(|(did, _), _| did != device_id);
-        }
-        self.listed_threads
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(device_id);
+        // Retain the bounded history and record identities through reconnects.
+        // Replayed records are not newly received messages.
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
@@ -567,14 +593,39 @@ impl Plugin for SmsPlugin {
         );
 
         let mut changed = Vec::new();
+        let mut live_messages = Vec::new();
+        let live_after = self
+            .live_after
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .copied()
+            .unwrap_or(i64::MAX);
+        let deletions = self.deletions.read().unwrap_or_else(|e| e.into_inner());
         if let Ok(mut threads) = self.threads.write() {
             for mut msg in messages {
+                let key = (device_id.to_string(), msg.thread_id.unwrap_or(0));
+                // Read/status updates may omit the original timestamp. Preserve
+                // updates to newer retained records, while rejecting unknown replay.
+                let date = msg
+                    .date
+                    .or_else(|| {
+                        let uid = msg.uid.or(msg.message_id)?;
+                        threads
+                            .get(&key)?
+                            .iter()
+                            .find(|old| old.uid.or(old.message_id) == Some(uid))?
+                            .date
+                    })
+                    .unwrap_or(0);
+                if !deletions.allows(device_id, msg.thread_id.unwrap_or(0), date) {
+                    continue;
+                }
                 trace!(
                     thread_id = msg.thread_id.unwrap_or(0),
                     event = "sms_received",
                     "Received individual SMS message"
                 );
-                let key = (device_id.to_string(), msg.thread_id.unwrap_or(0));
                 if !threads.contains_key(&key) {
                     // New thread: evict this device's oldest thread (by its
                     // newest message date) once the per-device cap is hit.
@@ -622,6 +673,12 @@ impl Plugin for SmsPlugin {
                     msg.read = msg.read.or(old.read);
                     thread[index] = msg.clone();
                 } else {
+                    if msg.message_type == Some(1) && msg.date.is_some_and(|date| date > live_after)
+                    {
+                        if let Some(uid) = msg.uid.or(msg.message_id) {
+                            live_messages.push((msg.thread_id.unwrap_or(0), uid));
+                        }
+                    }
                     thread.push(msg.clone());
                 }
                 thread.sort_by_key(|m| (m.date.unwrap_or(0), m.uid.or(m.message_id).unwrap_or(0)));
@@ -632,6 +689,7 @@ impl Plugin for SmsPlugin {
                 }
             }
         }
+        drop(deletions);
 
         {
             let stored: HashSet<_> = self
@@ -666,6 +724,7 @@ impl Plugin for SmsPlugin {
                     device_id: device_id.into(),
                     messages: changed.into_iter().map(|(message, _)| message).collect(),
                     created_threads,
+                    live_messages,
                 });
         }
         Ok(None)
@@ -679,7 +738,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn a_fresh_listing_does_not_merge_old_threads_or_destroy_their_history() {
+    async fn a_partial_listing_or_reconnect_never_shrinks_the_previous_list() {
         let plugin = SmsPlugin::new();
         let batch = |ids: &[i64]| {
             Packet::new(
@@ -695,20 +754,21 @@ mod tests {
             .unwrap();
         plugin.handle_packet("other", batch(&[4])).await.unwrap();
         plugin.begin_conversation_refresh("phone");
-        assert!(plugin.get_threads("phone").is_empty());
+        assert_eq!(plugin.thread_ids("phone"), HashSet::from([1, 2, 3]));
         assert_eq!(plugin.get_thread("phone", 1).len(), 1);
         assert_eq!(plugin.thread_ids("other"), HashSet::from([4]));
         plugin.handle_packet("phone", batch(&[2])).await.unwrap();
-        assert_eq!(plugin.thread_ids("phone"), HashSet::from([2]));
+        assert_eq!(plugin.thread_ids("phone"), HashSet::from([1, 2, 3]));
         // Empty or partial batches have no deletion/completion meaning.
         plugin.handle_packet("phone", batch(&[])).await.unwrap();
         plugin.handle_packet("phone", batch(&[1])).await.unwrap();
-        assert_eq!(plugin.thread_ids("phone"), HashSet::from([1, 2]));
+        assert_eq!(plugin.thread_ids("phone"), HashSet::from([1, 2, 3]));
         assert_eq!(plugin.get_thread("phone", 3).len(), 1);
         plugin.begin_conversation_refresh("phone");
-        assert!(plugin.get_threads("phone").is_empty());
+        plugin.on_disconnected("phone").await;
+        assert_eq!(plugin.thread_ids("phone"), HashSet::from([1, 2, 3]));
         plugin.handle_packet("phone", batch(&[3])).await.unwrap();
-        assert_eq!(plugin.get_threads("phone")[0].thread_id, 3);
+        assert_eq!(plugin.thread_ids("phone"), HashSet::from([1, 2, 3]));
     }
 
     #[tokio::test]
@@ -1024,7 +1084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_on_disconnected_cleans_up() {
+    async fn disconnect_preserves_history_but_unpair_forgets_it() {
         let plugin = SmsPlugin::new();
         let packet = Packet::new(
             "kdeconnect.sms.messages".to_string(),
@@ -1045,6 +1105,8 @@ mod tests {
         assert!(!plugin.get_threads("phone-1").is_empty());
 
         plugin.on_disconnected("phone-1").await;
+        assert!(!plugin.get_threads("phone-1").is_empty());
+        plugin.forget_attachments("phone-1").await;
         assert!(plugin.get_threads("phone-1").is_empty());
     }
 
@@ -1073,7 +1135,7 @@ mod tests {
             .expect("Value expected to be present");
 
         plugin.on_disconnected("phone-1").await;
-        assert!(plugin.get_threads("phone-1").is_empty());
+        assert!(!plugin.get_threads("phone-1").is_empty());
         assert!(!plugin.get_threads("phone-2").is_empty());
     }
 

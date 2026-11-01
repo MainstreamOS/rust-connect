@@ -689,6 +689,7 @@ mod tests {
                 device_id: "d".into(),
                 messages: vec![],
                 created_threads: vec![],
+                live_messages: vec![],
             })),
             "plugin.sms_messages_received",
         ));

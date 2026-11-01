@@ -108,6 +108,9 @@ pub enum PluginEvent {
         device_id: String,
         messages: Vec<crate::plugins::sms::SmsMessage>,
         created_threads: Vec<i64>,
+        /// New incoming records dated after the current connection/list request.
+        #[serde(default)]
+        live_messages: Vec<(i64, i64)>,
     },
     /// A phone's contacts changed, or stopped waiting for cards it never sent.
     ContactsChanged {
