@@ -324,7 +324,7 @@ async fn test_send_timeout_tears_down_the_link() {
 
 /// B3 (2026-09-02 audit): `disconnect` held the connections write lock
 /// across the dying socket's `shutdown().await`. On a stalled peer that is
-/// bounded only by TCP_USER_TIMEOUT (30 s), and every `is_connected`,
+/// bounded only by TCP_USER_TIMEOUT, and every `is_connected`,
 /// `send_packet`, accept and connect for EVERY device waited behind it.
 #[tokio::test]
 async fn test_disconnect_of_a_stalled_peer_does_not_block_other_lookups() {
@@ -1005,53 +1005,79 @@ async fn test_send_packet_after_disconnect_fails() {
 }
 
 #[tokio::test]
-async fn test_recv_packet_timeout() {
-    init_crypto();
-    let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
-    let cert_manager = Arc::new(CertificateManager::new(temp_dir.path().to_path_buf()));
-    cert_manager.init().expect("Value expected to be present");
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Value expected to be present");
-    let addr = listener.local_addr().expect("Value expected to be present");
-
-    let server_cm = Arc::new(
-        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"),
+async fn test_idle_receive_waits_for_the_peer() {
+    let (cm, mut peer, generation, _t, _pt) = setup_inbound_link().await;
+    let cm = Arc::new(cm);
+    tokio::time::pause();
+    let receiving = {
+        let cm = cm.clone();
+        tokio::spawn(async move {
+            cm.recv_packet_current(&INBOUND_PEER_ID.to_string(), generation)
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !receiving.is_finished(),
+        "an idle read must not cancel packet framing"
     );
-    server_cm.set_device_identity("server-self-aaaaaaaaaaaaaaaaaaaa", "Test Server");
-    let client_cm =
-        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present");
+    tokio::time::resume();
 
-    let server = server_cm.clone();
-    tokio::spawn(async move {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .expect("Value expected to be present");
-        server
-            .accept_test("clientaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), stream)
-            .await
-            .expect("Value expected to be present");
-    });
-
-    let device_id = "serveraaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-    client_cm
-        .connect(&device_id, addr)
+    use tokio::io::AsyncWriteExt;
+    let packet = Packet::ping();
+    let bytes = crate::protocol::packet::PacketSerializer::serialize(&packet).unwrap();
+    peer.write_all(&bytes).await.unwrap();
+    peer.flush().await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), receiving)
         .await
-        .expect("Value expected to be present");
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.packet_type, packet.packet_type);
+}
 
-    let result = client_cm.recv_packet(&device_id).await;
-    assert!(result.is_err(), "Should timeout when no packets are sent");
+#[tokio::test]
+async fn test_partial_packet_survives_idle_tick() {
+    let (cm, mut peer, generation, _t, _pt) = setup_inbound_link().await;
+    let cm = Arc::new(cm);
+    use tokio::io::AsyncWriteExt;
+    let packet = Packet::new(
+        "kdeconnect.clipboard".to_string(),
+        serde_json::json!({"content": "packet interrupted by a brief network stall"}),
+    );
+    let bytes = crate::protocol::packet::PacketSerializer::serialize(&packet).unwrap();
+    let split = bytes.len() / 2;
+    peer.write_all(&bytes[..split]).await.unwrap();
+    peer.flush().await.unwrap();
 
-    let gen = client_cm
-        .get_generation(&device_id)
+    tokio::time::pause();
+    let receiving = {
+        let cm = cm.clone();
+        tokio::spawn(async move {
+            cm.recv_packet_current(&INBOUND_PEER_ID.to_string(), generation)
+                .await
+        })
+    };
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !receiving.is_finished(),
+        "a delayed packet suffix must not discard its prefix"
+    );
+    tokio::time::resume();
+    peer.write_all(&bytes[split..]).await.unwrap();
+    peer.flush().await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), receiving)
         .await
-        .expect("Value expected to be present");
-    client_cm
-        .disconnect(&device_id, gen)
-        .await
-        .expect("Value expected to be present");
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.body, packet.body);
 }
 
 // MAJOR-2: end-to-end CN-mismatch rejection over real in-process TLS

@@ -17,12 +17,17 @@ pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// TCP_KEEPCNT (Linux): probes sent before the kernel gives up on the peer.
 pub const KEEPALIVE_RETRIES: u32 = 3;
-/// TCP_USER_TIMEOUT (Linux): bounds how long unacknowledged data may sit
-/// before the kernel fails the socket outright (kdeconnectd BUG 476747).
-pub const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+/// TCP_USER_TIMEOUT also overrides TCP_KEEPCNT on Linux. For idle sockets
+/// it counts from the last received packet, not the first keepalive probe.
+/// Allow the complete idle + probe budget; using only the 30s idle period
+/// closes the socket after one unanswered probe instead of all three.
+/// Unacknowledged payload data remains bounded by the same deadline.
+pub const TCP_USER_TIMEOUT: Duration = Duration::from_secs(
+    KEEPALIVE_IDLE.as_secs() + KEEPALIVE_INTERVAL.as_secs() * KEEPALIVE_RETRIES as u64,
+);
 
 /// Configures TCP keepalive on a stream.
-/// On Linux: 30s idle, 10s interval, 3 retries.
+/// On Linux: 30s idle, 10s interval, 3 retries, 60s unacknowledged-data limit.
 /// On other platforms: OS defaults.
 pub fn configure_keepalive(stream: &TcpStream) {
     let sock_ref = SockRef::from(stream);

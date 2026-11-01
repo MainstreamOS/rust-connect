@@ -19,7 +19,7 @@
 //!   "$TOOLBIN/cargo" test --test fault_suite --locked
 //! ```
 //! Non-root runs of the ordinary `cargo test` suite pass this file cleanly
-//! with two skip lines. Each scenario is deliberately slow (the keepalive
+//! with explicit skip lines. Each scenario is deliberately slow (the keepalive
 //! scenario waits out a REAL kernel TCP_USER_TIMEOUT/keepalive cycle, up to
 //! ~70s) — this suite is explicit on-demand, not a hot loop, matching the
 //! brief's framing for root-only coverage.
@@ -53,7 +53,7 @@ use rust_connect::device::types::DeviceType;
 use rust_connect::protocol::connection::CONNECTION_RATE_LIMIT;
 use rust_connect::protocol::connection_loop::{run_packet_loop, LoopResult};
 use rust_connect::protocol::keepalive::{
-    KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_RETRIES, TCP_USER_TIMEOUT,
+    configure_keepalive, KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_RETRIES, TCP_USER_TIMEOUT,
 };
 use rust_connect::protocol::types::Identity;
 use rust_connect::protocol::{CertificateManager, ConnectionManager};
@@ -290,25 +290,12 @@ where
 
 // --- fault-suite specific helpers --------------------------------------
 
-/// Worst-case bound before a genuinely blackholed peer's death is observed
-/// on our side, derived from the REAL production keepalive constants (not
-/// re-hardcoded — a future tuning change widens/narrows this with it,
-/// rather than silently invalidating the suite, per the brief). Two
-/// independent kernel mechanisms can fire: `TCP_USER_TIMEOUT` bounds any
-/// unacknowledged data once retransmission starts (covers a blackhole that
-/// begins mid-write), and the keepalive idle+retries cycle covers a
-/// connection that was already idle when the blackhole began (the probe
-/// itself becomes the "unacknowledged data" `TCP_USER_TIMEOUT` then also
-/// bounds) — worst case is idle-until-first-probe plus that timeout, i.e.
-/// `KEEPALIVE_IDLE + TCP_USER_TIMEOUT`. +30s slack is scheduler/CI margin;
-/// this suite is explicit on-demand, not a hot loop.
+/// Linux counts TCP_USER_TIMEOUT from the last received packet for idle
+/// keepalive and from the first unacknowledged payload for a busy socket.
+/// Allow one probe interval for timer quantization plus scheduler slack.
 fn keepalive_death_deadline() -> Duration {
-    let idle_then_probe_timeout = KEEPALIVE_IDLE + TCP_USER_TIMEOUT;
     let keepalive_cycle = KEEPALIVE_IDLE + KEEPALIVE_INTERVAL * KEEPALIVE_RETRIES;
-    idle_then_probe_timeout
-        .max(keepalive_cycle)
-        .max(TCP_USER_TIMEOUT)
-        + Duration::from_secs(30)
+    TCP_USER_TIMEOUT.max(keepalive_cycle) + KEEPALIVE_INTERVAL + Duration::from_secs(30)
 }
 
 fn dev_id(tag: &str) -> String {
@@ -394,6 +381,66 @@ fn peer_identity(peer_id: &str, tcp_port: u16) -> Identity {
     );
     identity.tcp_port = Some(tcp_port);
     identity
+}
+
+/// Losing the first keepalive probe must not consume the whole retry budget.
+/// A 30s TCP_USER_TIMEOUT used to override TCP_KEEPCNT and kill this socket
+/// at the second probe timer, before the temporary outage ends.
+#[tokio::test]
+async fn netns_idle_link_survives_a_missed_keepalive_probe() {
+    if !preconditions_met("netns_idle_link_survives_a_missed_keepalive_probe") {
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ns = NetnsGuard::create("idle-recovery");
+    let veth = VethGuard::create(&ns);
+    let (port_tx, port_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let ns_name = ns.name.clone();
+    let peer_worker = std::thread::spawn(move || {
+        run_in_netns(&ns_name, move || async move {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            port_tx.send(listener.local_addr().unwrap().port()).unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            if resume_rx.await.is_ok() {
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    peer.write_all(b"recovered").await.unwrap();
+                    let mut reply = [0; 2];
+                    peer.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply, b"ok");
+                })
+                .await
+                .expect("the restored connection must exchange data");
+            }
+        });
+    });
+    let peer_port = port_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let mut socket = tokio::net::TcpStream::connect((veth.ns_ip.as_str(), peer_port))
+        .await
+        .unwrap();
+    configure_keepalive(&socket);
+    let blackhole = BlackholeGuard::engage(&veth.ns_ip);
+    // Restore between the second and third probe opportunities. The old
+    // deadline fails at the second opportunity; the intended retry budget
+    // permits the original connection to recover without a redial.
+    tokio::time::sleep(KEEPALIVE_IDLE + KEEPALIVE_INTERVAL + KEEPALIVE_INTERVAL / 2).await;
+    drop(blackhole);
+    resume_tx.send(()).unwrap();
+    let mut received = [0; 9];
+    let result = tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut received))
+        .await
+        .expect("the resumed peer must be readable");
+    if result.is_err() {
+        // Unblock the peer before reporting failure so its namespace and
+        // socket do not outlive the test's cleanup guards.
+        drop(socket);
+        let _ = peer_worker.join();
+        panic!("a missed keepalive probe must not close the link: {result:?}");
+    }
+    assert_eq!(&received, b"recovered");
+    socket.write_all(b"ok").await.unwrap();
+    peer_worker.join().unwrap();
 }
 
 /// Scenario 1 (brief, the headline): a real TLS link across a veth pair,

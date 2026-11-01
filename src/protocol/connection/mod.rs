@@ -812,31 +812,15 @@ impl ConnectionManager {
             let mut line = Vec::new();
             let read_result = {
                 let mut read_stream = conn_handle.read_stream.lock().await;
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    read_steady_line(&mut *read_stream, &mut line, MAX_STEADY_PACKET_SIZE),
-                )
-                .await
+                // Keep the partial line alive while the peer is idle. Canceling
+                // this read on a periodic tick discards bytes already consumed.
+                // Socket keepalive detects dead links; the owner cancels the
+                // packet loop when replacing or explicitly closing a link.
+                read_steady_line(&mut *read_stream, &mut line, MAX_STEADY_PACKET_SIZE).await
             };
 
             match read_result {
-                Err(_) => {
-                    // Routine idle tick (30s read timeout drives the loop's
-                    // liveness check), NOT an anomaly: two connected phones
-                    // produce ~4 of these per minute, forever. debug!, not
-                    // warn! — at WARN this was 20k journal lines in 4 days
-                    // and drowned real disconnect signals.
-                    debug!(
-                        device_id = %device_id,
-                        event = "packet_recv_timeout",
-                        "Timed out receiving packet"
-                    );
-                    return Err(Error::ConnectionTimeout(format!(
-                        "Timed out receiving packet from {}",
-                        device_id
-                    )));
-                }
-                Ok(Ok(SteadyLine::Eof)) => {
+                Ok(SteadyLine::Eof) => {
                     // EOF: the peer closed the link.
                     warn!(
                         device_id = %device_id,
@@ -848,7 +832,7 @@ impl ConnectionManager {
                         device_id
                     )));
                 }
-                Ok(Ok(SteadyLine::OversizeSkipped)) => {
+                Ok(SteadyLine::OversizeSkipped) => {
                     warn!(
                         device_id = %device_id,
                         event = "packet_oversize_skipped",
@@ -856,7 +840,7 @@ impl ConnectionManager {
                     );
                     continue;
                 }
-                Ok(Ok(SteadyLine::Line(n))) => {
+                Ok(SteadyLine::Line(n)) => {
                     if line.iter().all(|b| b.is_ascii_whitespace()) {
                         trace!(
                             device_id = %device_id,
@@ -874,7 +858,7 @@ impl ConnectionManager {
                     conn_handle.info.lock().await.increment_received();
                     break PacketSerializer::deserialize(&line)?;
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     error!(
                         device_id = %device_id,
                         error = %e,
@@ -965,7 +949,7 @@ impl ConnectionManager {
         }
         // B3 (2026-09-02 audit): release the connections lock BEFORE the
         // socket shutdown. On a stalled peer the shutdown blocks until
-        // TCP_USER_TIMEOUT (30 s), and every lookup, send, accept and
+        // TCP_USER_TIMEOUT, and every lookup, send, accept and
         // connect for every other device waited behind this lock for it.
         drop(connections);
 
