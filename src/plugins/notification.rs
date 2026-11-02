@@ -47,6 +47,8 @@ fn escape_markup(text: &str) -> String {
 #[serde(rename_all = "camelCase")]
 pub struct NotificationBody {
     #[serde(default)]
+    pub time: Option<serde_json::Value>,
+    #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub app_name: Option<String>,
@@ -84,6 +86,8 @@ pub struct NotificationBody {
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationEntry {
+    /// Original Android posting time; receiving a replay must not redate it.
+    pub posted_at: Option<i64>,
     pub device_id: String,
     pub id: String,
     pub app_name: String,
@@ -720,6 +724,7 @@ impl NotificationPlugin {
         let _ = self.dedupe_take(device_id, notification_id);
 
         self.plugin_events.broadcast(PluginEvent::Notification {
+            posted_at: None,
             device_id: device_id.to_string(),
             id: notification_id.to_string(),
             // Same defaults the inbound cancel branch lands on: a cancel names a
@@ -871,6 +876,11 @@ impl Plugin for NotificationPlugin {
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
         if packet.packet_type == "kdeconnect.notification" {
             let body: NotificationBody = packet.body_as("notification")?;
+            let posted_at = body
+                .time
+                .as_ref()
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+                .filter(|time| *time > 0 && *time <= 9_007_199_254_740_991);
             let app_name = body.app_name.as_deref().unwrap_or("unknown");
             let title = body.title.as_deref().unwrap_or("");
             let text = body.text.as_deref().unwrap_or("");
@@ -923,6 +933,7 @@ impl Plugin for NotificationPlugin {
                 // the desktop popup close are best-effort; repeating the
                 // cancel for an unknown key is harmless upstream shape.
                 self.plugin_events.broadcast(PluginEvent::Notification {
+                    posted_at: None,
                     device_id: device_id.to_string(),
                     id: id.to_string(),
                     app_name: app_name.to_string(),
@@ -1048,6 +1059,7 @@ impl Plugin for NotificationPlugin {
                     history.retain(|entry| !(entry.device_id == device_id && entry.id == id));
                 }
                 let entry = NotificationEntry {
+                    posted_at,
                     device_id: device_id.to_string(),
                     id: id.to_string(),
                     app_name: app_name.to_string(),
@@ -1104,6 +1116,7 @@ impl Plugin for NotificationPlugin {
                 }
             }
             self.plugin_events.broadcast(PluginEvent::Notification {
+                posted_at,
                 device_id: device_id.to_string(),
                 id: id.to_string(),
                 app_name: app_name.to_string(),
@@ -1149,6 +1162,31 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("{label}: timed out waiting for the event"))
             .unwrap_or_else(|e| panic!("{label}: broadcast channel closed: {e:?}"))
+    }
+
+    #[tokio::test]
+    async fn phone_posting_time_accepts_android_strings_and_rejects_invalid_values() {
+        let plugin = make_plugin();
+        for (value, expected) in [
+            (serde_json::json!("1700000000000"), Some(1700000000000)),
+            (serde_json::json!(1700000000001i64), Some(1700000000001)),
+            (serde_json::Value::Null, None),
+            (serde_json::json!("invalid"), None),
+            (serde_json::json!(-1), None),
+            (serde_json::json!(true), None),
+            (serde_json::json!(9007199254740992i64), None),
+        ] {
+            plugin.handle_packet("phone", Packet::new("kdeconnect.notification".into(),
+                serde_json::json!({"id":"same", "appName":"Messages", "text":"Hello", "time":value})))
+                .await.unwrap();
+            assert_eq!(
+                plugin
+                    .active_notification("phone", "same")
+                    .unwrap()
+                    .posted_at,
+                expected
+            );
+        }
     }
 
     #[test]

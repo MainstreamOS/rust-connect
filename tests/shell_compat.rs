@@ -341,6 +341,76 @@ async fn android_notification_keys_are_legal_objects_and_reconnects_do_not_dupli
     .await;
     service.stop().await;
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phone_notification_time_survives_replay_but_identical_new_messages_still_post() {
+    let bus = Bus::new();
+    let temp = tempfile::tempdir().unwrap();
+    let app = state(temp.path()).await;
+    let desktop = Desktop::default();
+    let seen = desktop.seen.clone();
+    let hints = desktop.hints.clone();
+    let desktop_bus = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name("org.freedesktop.Notifications")
+        .unwrap()
+        .serve_at("/org/freedesktop/Notifications", desktop)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let connection = bus.connect(Some("org.kde.kdeconnect")).await;
+    let service = DBusService::on_connection(
+        app.clone(),
+        connection,
+        temp.path().join("contacts"),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    for (index, time) in ["1700000000000", "1700000001000"].into_iter().enumerate() {
+        app.plugins.notification.handle_packet("phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Packet::new("kdeconnect.notification".into(), serde_json::json!({
+                "id":"same-conversation", "appName":"Messages", "title":"Sender", "text":"Same text", "time":time
+            }))).await.unwrap();
+        until(|| async { seen.lock().unwrap().len() == index + 1 }).await;
+        let guard = hints.lock().unwrap();
+        assert_eq!(
+            i64::try_from(&guard[index]["x-mainstream-phone-time"]).unwrap(),
+            time.parse::<i64>().unwrap()
+        );
+        assert_eq!(
+            <&str>::try_from(&guard[index]["x-mainstream-notification-key"]).unwrap(),
+            <&str>::try_from(&guard[0]["x-mainstream-notification-key"]).unwrap()
+        );
+    }
+    // A shell restart re-publishes the active phone notification under a new
+    // desktop ID. It must retain the phone's timestamp and key.
+    drop(desktop_bus);
+    let replay = Desktop::default();
+    let replay_hints = replay.hints.clone();
+    let _restarted = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name("org.freedesktop.Notifications")
+        .unwrap()
+        .serve_at("/org/freedesktop/Notifications", replay)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    until(|| async {
+        app.plugins.notification.handle_packet("phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Packet::new("kdeconnect.notification".into(), serde_json::json!({
+                "id":"same-conversation", "appName":"Messages", "title":"Sender", "text":"Same text", "time":"1700000001000", "silent":true
+            }))).await.unwrap();
+        !replay_hints.lock().unwrap().is_empty()
+    }).await;
+    assert_eq!(
+        i64::try_from(&replay_hints.lock().unwrap()[0]["x-mainstream-phone-time"]).unwrap(),
+        1700000001000
+    );
+    service.stop().await;
+}
+
 #[test]
 fn storage_roots_and_identifiers_match_the_shells_actual_path_usage() {
     use rust_connect::{

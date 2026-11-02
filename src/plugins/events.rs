@@ -10,6 +10,8 @@ use crate::device::events::Broadcaster;
 #[serde(tag = "type")]
 pub enum PluginEvent {
     Notification {
+        #[serde(default)]
+        posted_at: Option<i64>,
         device_id: String,
         id: String,
         app_name: String,
@@ -154,6 +156,7 @@ mod tests {
         let mut rx = broadcaster.subscribe();
 
         broadcaster.broadcast(PluginEvent::Notification {
+            posted_at: None,
             device_id: "phone-1".to_string(),
             id: "notif-123".to_string(),
             app_name: "WhatsApp".to_string(),
@@ -202,6 +205,7 @@ mod tests {
     #[tokio::test]
     async fn test_serialization_roundtrip() {
         let event = PluginEvent::Notification {
+            posted_at: None,
             device_id: "phone-1".to_string(),
             id: "notif-123".to_string(),
             app_name: "WhatsApp".to_string(),

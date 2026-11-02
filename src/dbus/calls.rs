@@ -92,6 +92,7 @@ impl Context {
             .map(|d| d.name)
             .unwrap_or_else(|_| "Phone".into());
         self.notification_event(PluginEvent::Notification {
+            posted_at: None,
             device_id: device.into(),
             id,
             app_name: "Phone".into(),

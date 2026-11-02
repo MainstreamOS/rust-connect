@@ -55,6 +55,7 @@ impl NotificationSync {
 /// The event that withdraws a notification from the desktop.
 pub(crate) fn cancelled(device: &str, id: String) -> PluginEvent {
     PluginEvent::Notification {
+        posted_at: None,
         device_id: device.into(),
         id,
         app_name: String::new(),
@@ -130,6 +131,7 @@ impl Context {
         }
         for n in entries {
             self.notification_event(PluginEvent::Notification {
+                posted_at: n.posted_at,
                 device_id: n.device_id,
                 id: n.id,
                 app_name: n.app_name,
@@ -205,6 +207,7 @@ impl Context {
             actions,
             reply_id,
             icon_hash,
+            posted_at,
             ..
         } = event
         else {
@@ -254,6 +257,7 @@ impl Context {
             &reply_id,
             &icon_hash,
             image.is_some(),
+            posted_at,
         ))
         .unwrap_or_default();
         let notification_key = notification_key(&device_id, &id);
@@ -352,6 +356,9 @@ impl Context {
             "x-mainstream-notification-key",
             OwnedValue::from(Str::from(notification_key.as_str())),
         );
+        if let Some(time) = posted_at {
+            hints.insert("x-mainstream-phone-time", OwnedValue::from(time));
+        }
         hints.insert(
             "x-kde-display-appname",
             OwnedValue::from(Str::from(record.app.as_str())),
