@@ -179,6 +179,18 @@ enum DesktopAction {
     Replace(u32),
 }
 
+/// The text part of an Android ticker, "<title>: <text>". Some notification
+/// styles, a picture one among them, leave `text` empty and carry their
+/// sentence only there.
+fn ticker_text(title: &str, ticker: &str) -> String {
+    ticker
+        .strip_prefix(title)
+        .unwrap_or(ticker)
+        .trim_start_matches(':')
+        .trim()
+        .to_string()
+}
+
 /// Hash of the user-visible content of a notification.
 fn content_signature(app_name: &str, title: &str, text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -883,9 +895,16 @@ impl Plugin for NotificationPlugin {
                 .filter(|time| *time > 0 && *time <= 9_007_199_254_740_991);
             let app_name = body.app_name.as_deref().unwrap_or("unknown");
             let title = body.title.as_deref().unwrap_or("");
-            let text = body.text.as_deref().unwrap_or("");
             let id = body.id.as_deref().unwrap_or("");
             let ticker = body.ticker.as_deref().unwrap_or("");
+            let text = body.text.as_deref().unwrap_or("");
+            let from_ticker;
+            let text = if text.is_empty() {
+                from_ticker = ticker_text(title, ticker);
+                from_ticker.as_str()
+            } else {
+                text
+            };
             let is_cancel = body.is_cancel.unwrap_or(false);
             let silent = body.silent.unwrap_or(false);
             let actions = body.actions.clone();
@@ -1198,6 +1217,54 @@ mod tests {
         assert_eq!(escape_markup("&lt;"), "&amp;lt;");
         assert_eq!(escape_markup("plain text"), "plain text");
         assert_eq!(escape_markup(""), "");
+    }
+
+    #[test]
+    fn test_ticker_text() {
+        // Reddit's picture notifications: the title already ends in a colon.
+        assert_eq!(
+            ticker_text("GeminiAI:", "GeminiAI:: The AA benchmark has been updated."),
+            "The AA benchmark has been updated."
+        );
+        assert_eq!(ticker_text("Alice", "Alice: hello there"), "hello there");
+        assert_eq!(ticker_text("", "just a ticker"), "just a ticker");
+        assert_eq!(ticker_text("Other", "Alice: hello"), "Alice: hello");
+        assert_eq!(ticker_text("Alice", "Alice"), "");
+        assert_eq!(ticker_text("Alice", ""), "");
+    }
+
+    /// A notification that sends no text takes it from its ticker, and one
+    /// that sends text keeps it.
+    #[tokio::test]
+    async fn test_empty_text_falls_back_to_the_ticker() {
+        let broadcaster = Arc::new(PluginEventBroadcaster::new(16, "plugin"));
+        let mut rx = broadcaster.subscribe();
+        let plugin = NotificationPlugin::new_without_desktop(broadcaster.clone());
+
+        for (id, text, expected) in [
+            ("picture-1", "", "The AA benchmark has been updated."),
+            ("plain-1", "Streaming on MacBook?!", "Streaming on MacBook?!"),
+        ] {
+            let packet = Packet::new(
+                "kdeconnect.notification".to_string(),
+                serde_json::json!({
+                    "id": id,
+                    "appName": "Reddit",
+                    "title": "GeminiAI:",
+                    "text": text,
+                    "ticker": "GeminiAI:: The AA benchmark has been updated."
+                }),
+            );
+            assert!(plugin.handle_packet("phone-1", packet).await.is_ok());
+            match recv_event(&mut rx, "expected notification event").await {
+                PluginEvent::Notification { text, .. } => assert_eq!(text, expected),
+                _ => panic!("Wrong event type"),
+            }
+        }
+        let history = plugin.get_history(Some("phone-1"), 10);
+        assert!(history
+            .iter()
+            .any(|entry| entry.id == "picture-1" && entry.text == "The AA benchmark has been updated."));
     }
 
     /// History and broadcast events keep the raw peer text (they are JSON,
