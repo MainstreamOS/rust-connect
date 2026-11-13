@@ -2,7 +2,8 @@
 use super::{failure, Context};
 use crate::{plugins::sms::SmsMessage, protocol::types::Packet};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::sync::broadcast::error::RecvError;
 use zbus::{
     interface,
     zvariant::{OwnedValue, Type, Value},
@@ -112,10 +113,32 @@ pub fn send_packet(
     Ok(Packet::new("kdeconnect.sms.request".into(), body))
 }
 
-pub fn history_packet(thread: i64, count: usize) -> Packet {
+const OLDER_PAGE_WAIT: Duration = Duration::from_secs(40);
+const BOUNDARY_GRACE: Duration = Duration::from_secs(5);
+
+/// The messages of one phone reply that form the page ending at `before`.
+/// Android replies carry no request ID, but a page holds its inclusive
+/// boundary and nothing newer; a reply to any other range fails one of the two.
+fn older_page(messages: &[SmsMessage], thread: i64, before: i64) -> Option<Vec<&SmsMessage>> {
+    let mut boundary = false;
+    let mut page = Vec::new();
+    for message in messages.iter().filter(|m| m.thread_id == Some(thread)) {
+        match message.date {
+            Some(date) if date > before => return None,
+            Some(date) => {
+                boundary |= date == before;
+                page.push(message);
+            }
+            None => {}
+        }
+    }
+    boundary.then_some(page)
+}
+
+pub fn history_packet(thread: i64, before: i64, count: usize) -> Packet {
     Packet::new(
         "kdeconnect.sms.request_conversation".into(),
-        serde_json::json!({"threadID":thread, "rangeStartTimestamp":-1,"numberToRequest":count}),
+        serde_json::json!({"threadID":thread, "rangeStartTimestamp":before,"numberToRequest":count}),
     )
 }
 pub fn attachment_packet(part: i64, identifier: &str) -> Packet {
@@ -285,8 +308,62 @@ impl Conversations {
             .await
             .map_err(failure)?;
         self.context
-            .send(&self.device, history_packet(thread, end as usize))
+            .send(&self.device, history_packet(thread, -1, end as usize))
             .await
+    }
+    #[zbus(name = "requestOlderConversation")]
+    async fn older_history(
+        &self,
+        thread: i64,
+        before: i64,
+        count: i32,
+    ) -> zbus::fdo::Result<Vec<OwnedValue>> {
+        if thread < 0 || before <= 0 || !(1..=100).contains(&count) {
+            return Err(failure("Invalid older conversation range"));
+        }
+        let mut events = self.context.app.plugin_events.subscribe();
+        self.context
+            .send(&self.device, history_packet(thread, before, count as usize))
+            .await?;
+        let mut deadline = tokio::time::Instant::now() + OLDER_PAGE_WAIT;
+        let mut boundary_only = None;
+        loop {
+            let event = match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(event)) => event,
+                // Other events can outrun this receiver; the page may still follow.
+                Ok(Err(RecvError::Lagged(_))) => continue,
+                Ok(Err(RecvError::Closed)) => return Err(failure("Phone message stream ended")),
+                Err(_) => {
+                    return boundary_only
+                        .ok_or_else(|| failure("The phone did not return older messages"))
+                }
+            };
+            let crate::plugins::PluginEvent::SmsMessagesReceived {
+                device_id, messages, ..
+            } = event
+            else {
+                continue;
+            };
+            if device_id != self.device {
+                continue;
+            }
+            let Some(page) = older_page(&messages, thread, before) else {
+                continue;
+            };
+            let page: Vec<_> = page
+                .into_iter()
+                .filter_map(|message| Message::try_from(message).ok())
+                .map(|message| OwnedValue::try_from(Value::from(message)).map_err(failure))
+                .collect::<Result<_, _>>()?;
+            // The conversation list can replay just the boundary message, so a
+            // lone boundary ends the history only when no page follows it.
+            if page.len() == 1 {
+                boundary_only = Some(page);
+                deadline = deadline.min(tokio::time::Instant::now() + BOUNDARY_GRACE);
+                continue;
+            }
+            return Ok(page);
+        }
     }
     #[zbus(name = "sendWithoutConversation")]
     async fn new_message(
@@ -542,11 +619,40 @@ mod tests {
         );
     }
     #[test]
+    fn older_pages_are_told_from_replies_to_other_ranges() {
+        let reply = |rows: &[(i64, i64, i64)]| -> Vec<SmsMessage> {
+            rows.iter()
+                .map(|(thread, uid, date)| {
+                    serde_json::from_value(
+                        serde_json::json!({"thread_id":thread,"_id":uid,"date":date}),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        let ids = |messages: &[SmsMessage]| {
+            older_page(messages, 42, 1000)
+                .map(|page| page.iter().filter_map(|m| m.uid).collect::<Vec<_>>())
+        };
+        // An earlier page, and a refresh of the newest messages that reaches the boundary.
+        assert_eq!(ids(&reply(&[(42, 3, 900)])), None);
+        assert_eq!(ids(&reply(&[(42, 5, 1000), (42, 6, 1100)])), None);
+        assert_eq!(
+            ids(&reply(&[(42, 4, 999), (42, 5, 1000), (43, 9, 998)])),
+            Some(vec![4, 5])
+        );
+        assert_eq!(ids(&reply(&[(42, 5, 1000)])), Some(vec![5]));
+    }
+    #[test]
     fn request_packets_use_androids_receiver_keys() {
-        let packet = history_packet(52, 100);
+        let packet = history_packet(52, -1, 100);
         assert_eq!(
             packet.body,
             serde_json::json!({"threadID":52,"rangeStartTimestamp":-1,"numberToRequest":100})
+        );
+        assert_eq!(
+            history_packet(52, 1700000000000, 100).body["rangeStartTimestamp"],
+            1700000000000i64
         );
         assert_eq!(
             attachment_packet(12, "voice.amr").body,
