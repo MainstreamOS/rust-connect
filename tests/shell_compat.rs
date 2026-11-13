@@ -1663,46 +1663,67 @@ async fn older_conversation_requests_use_the_date_cursor_and_return_the_phone_pa
             .await
             .unwrap()
     };
-    let reply = async {
-        let packet = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
-        assert_eq!(packet.packet_type, "kdeconnect.sms.request_conversation");
-        assert_eq!(
-            packet.body,
-            serde_json::json!({"threadID":42,"rangeStartTimestamp":1000,"numberToRequest":100})
-        );
-        app.plugins.sms.handle_packet(
+    let reply =
+        async {
+            let packet = phone.manager.recv_packet(&DESKTOP.into()).await.unwrap();
+            assert_eq!(packet.packet_type, "kdeconnect.sms.request_conversation");
+            assert_eq!(
+                packet.body,
+                serde_json::json!({"threadID":42,"rangeStartTimestamp":1000,"numberToRequest":100})
+            );
+            app.plugins.sms.handle_packet(
             PHONE,
             Packet::new("kdeconnect.sms.messages".into(), serde_json::json!({"messages":[
                 {"thread_id":42,"_id":3,"date":900,"body":"late reply to a different page"}
             ]})),
         ).await.unwrap();
-        app.plugins.sms.handle_packet(
-            PHONE,
-            Packet::new("kdeconnect.sms.messages".into(), serde_json::json!({"messages":[
-                {"thread_id":42,"_id":5,"date":1000,"body":"conversation list replay"}
-            ]})),
-        ).await.unwrap();
-        app.plugins.sms.handle_packet(
+            app.plugins
+                .sms
+                .handle_packet(
+                    PHONE,
+                    Packet::new(
+                        "kdeconnect.sms.messages".into(),
+                        serde_json::json!({"messages":[
+                            {"thread_id":42,"_id":5,"date":1000,"body":"conversation list replay"}
+                        ]}),
+                    ),
+                )
+                .await
+                .unwrap();
+            app.plugins.sms.handle_packet(
             PHONE,
             Packet::new("kdeconnect.sms.messages".into(), serde_json::json!({"messages":[
                 {"thread_id":42,"_id":5,"date":1000,"body":"already loaded"},
                 {"thread_id":42,"_id":7,"date":1100,"body":"refresh of the newest messages"}
             ]})),
         ).await.unwrap();
-        app.plugins.sms.handle_packet(
-            PHONE,
-            Packet::new("kdeconnect.sms.messages".into(), serde_json::json!({"messages":[
-                {"thread_id":42,"_id":4,"date":999,"body":"older"},
-                {"thread_id":42,"_id":5,"date":1000,"body":"already loaded"},
-                {"thread_id":43,"_id":6,"date":998,"body":"other thread"}
-            ]})),
-        ).await.unwrap();
-    };
-    let (page, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(fetch, reply) })
-        .await
-        .unwrap();
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            app.plugins
+                .sms
+                .handle_packet(
+                    PHONE,
+                    Packet::new(
+                        "kdeconnect.sms.messages".into(),
+                        serde_json::json!({"messages":[
+                            {"thread_id":42,"_id":4,"date":999,"body":"older"},
+                            {"thread_id":42,"_id":5,"date":1000,"body":"already loaded"},
+                            {"thread_id":43,"_id":6,"date":998,"body":"other thread"}
+                        ]}),
+                    ),
+                )
+                .await
+                .unwrap();
+        };
+    let (page, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(fetch, reply)
+    })
+    .await
+    .unwrap();
     assert_eq!(page.len(), 2);
-    let ids: Vec<_> = page.into_iter().map(|value| Message::try_from(value).unwrap().uid).collect();
+    let ids: Vec<_> = page
+        .into_iter()
+        .map(|value| Message::try_from(value).unwrap().uid)
+        .collect();
     assert_eq!(ids, vec![4, 5]);
     service.stop().await;
 }
@@ -1731,6 +1752,18 @@ async fn the_oldest_message_alone_ends_the_history_without_the_full_wait() {
     .await
     .unwrap();
 
+    app.plugins
+        .sms
+        .handle_packet(
+            PHONE,
+            Packet::new(
+                "kdeconnect.sms.messages".into(),
+                serde_json::json!({"messages":[{"thread_id":42,"_id":6,"date":1100,"body":"newer"}]}),
+            ),
+        )
+        .await
+        .unwrap();
+
     let fetch = async {
         proxy
             .call::<_, _, Vec<OwnedValue>>("requestOlderConversation", &(42i64, 1000i64, 100i32))
@@ -1746,10 +1779,14 @@ async fn the_oldest_message_alone_ends_the_history_without_the_full_wait() {
             ]})),
         ).await.unwrap();
     };
-    let (page, ()) = tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(fetch, reply) })
-        .await
-        .unwrap();
-    let ids: Vec<_> = page.into_iter().map(|value| Message::try_from(value).unwrap().uid).collect();
+    let (page, ()) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(fetch, reply) })
+            .await
+            .unwrap();
+    let ids: Vec<_> = page
+        .into_iter()
+        .map(|value| Message::try_from(value).unwrap().uid)
+        .collect();
     assert_eq!(ids, vec![5]);
     service.stop().await;
 }

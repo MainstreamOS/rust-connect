@@ -114,7 +114,6 @@ pub fn send_packet(
 }
 
 const OLDER_PAGE_WAIT: Duration = Duration::from_secs(40);
-const BOUNDARY_GRACE: Duration = Duration::from_secs(5);
 
 /// The messages of one phone reply that form the page ending at `before`.
 /// Android replies carry no request ID, but a page holds its inclusive
@@ -325,7 +324,15 @@ impl Conversations {
         self.context
             .send(&self.device, history_packet(thread, before, count as usize))
             .await?;
-        let mut deadline = tokio::time::Instant::now() + OLDER_PAGE_WAIT;
+        let deadline = tokio::time::Instant::now() + OLDER_PAGE_WAIT;
+        let has_newer = self
+            .context
+            .app
+            .plugins
+            .sms
+            .latest_message(&self.device, thread)
+            .and_then(|message| message.date)
+            .is_some_and(|date| date > before);
         let mut boundary_only = None;
         loop {
             let event = match tokio::time::timeout_at(deadline, events.recv()).await {
@@ -339,7 +346,9 @@ impl Conversations {
                 }
             };
             let crate::plugins::PluginEvent::SmsMessagesReceived {
-                device_id, messages, ..
+                device_id,
+                messages,
+                ..
             } = event
             else {
                 continue;
@@ -355,11 +364,10 @@ impl Conversations {
                 .filter_map(|message| Message::try_from(message).ok())
                 .map(|message| OwnedValue::try_from(Value::from(message)).map_err(failure))
                 .collect::<Result<_, _>>()?;
-            // The conversation list can replay just the boundary message, so a
-            // lone boundary ends the history only when no page follows it.
-            if page.len() == 1 {
+            // The conversation list only replays the newest message. When we
+            // have no newer message, wait for the real page before ending history.
+            if page.len() == 1 && !has_newer {
                 boundary_only = Some(page);
-                deadline = deadline.min(tokio::time::Instant::now() + BOUNDARY_GRACE);
                 continue;
             }
             return Ok(page);
